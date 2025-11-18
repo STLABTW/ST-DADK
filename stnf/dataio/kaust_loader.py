@@ -191,6 +191,9 @@ class KAUSTWindowDataset(Dataset):
         stride: 슬라이딩 윈도우 stride (기본 1)
         t0_min: 최소 t0 (None이면 L 사용)
         t0_max: 최대 t0 (None이면 T-H+1 사용)
+        use_coords_cov: (x, y)를 covariates로 사용
+        use_time_cov: t를 covariates로 사용
+        time_encoding: 시간 인코딩 방법 {linear, sinusoidal}
     """
     def __init__(
         self,
@@ -201,7 +204,10 @@ class KAUSTWindowDataset(Dataset):
         H: int,
         stride: int = 1,
         t0_min: int = None,
-        t0_max: int = None
+        t0_max: int = None,
+        use_coords_cov: bool = False,
+        use_time_cov: bool = False,
+        time_encoding: str = 'linear'
     ):
         self.z_full = z_full  # (T, S)
         self.coords = coords  # (S, 2)
@@ -209,9 +215,22 @@ class KAUSTWindowDataset(Dataset):
         self.L = L
         self.H = H
         self.stride = stride
+        self.use_coords_cov = use_coords_cov
+        self.use_time_cov = use_time_cov
+        self.time_encoding = time_encoding
         
         self.T, self.S = z_full.shape
         self.n_obs = len(obs_indices)
+        
+        # Covariates 차원 계산
+        self.p_covariates = 0
+        if use_coords_cov:
+            self.p_covariates += 2  # (x, y)
+        if use_time_cov:
+            if time_encoding == 'sinusoidal':
+                self.p_covariates += 2  # (sin(t), cos(t))
+            else:  # linear
+                self.p_covariates += 1  # t
         
         # 유효한 윈도우 시작점
         # t0-L >= 0 이고 t0+H <= T
@@ -222,7 +241,8 @@ class KAUSTWindowDataset(Dataset):
         
         self.valid_t0 = list(range(t0_min, t0_max, stride))
         
-        print(f"[INFO] Dataset: {len(self.valid_t0)} windows (L={L}, H={H}, stride={stride}, t0=[{t0_min}, {t0_max}))")
+        cov_info = f", p_cov={self.p_covariates}" if self.p_covariates > 0 else ""
+        print(f"[INFO] Dataset: {len(self.valid_t0)} windows (L={L}, H={H}, stride={stride}, t0=[{t0_min}, {t0_max}){cov_info})")
     
     def __len__(self):
         return len(self.valid_t0)
@@ -234,13 +254,13 @@ class KAUSTWindowDataset(Dataset):
         y_hist_obs = self.z_full[t0-self.L:t0, self.obs_indices]  # (L, n_obs)
         # transpose 제거 - 이미 올바른 shape
         
-        # 2. Target: [t0, t0+H)의 전체 사이트
-        y_fut = self.z_full[t0:t0+self.H, :]  # (H, S)
+        # 2. Target: [t0, t0+H)의 관측 사이트만 (나머지는 어차피 NaN)
+        y_fut = self.z_full[t0:t0+self.H, self.obs_indices]  # (H, n_obs)
         # transpose 제거 - 이미 올바른 shape
         
-        # 3. 좌표
+        # 3. 좌표 (관측 사이트만)
         obs_coords = self.coords[self.obs_indices]  # (n_obs, 2)
-        target_coords = self.coords  # (S, 2)
+        target_coords = self.coords[self.obs_indices]  # (n_obs, 2) - 동일!
         
         # To torch
         return {

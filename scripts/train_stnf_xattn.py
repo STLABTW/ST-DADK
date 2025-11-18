@@ -255,6 +255,14 @@ class Trainer:
         # Save history to CSV and plot
         self.save_history(save_path)
         
+        # Visualize predictions on train/val sets
+        print("\nGenerating prediction visualizations...")
+        self.visualize_predictions(save_path)
+        
+        # Evaluate and save final performance summary
+        print("\nEvaluating final model performance...")
+        self.save_performance_summary(save_path)
+        
         return self.history
     
     def save_history(self, model_path: str):
@@ -326,6 +334,373 @@ class Trainer:
         plt.close()
         
         print(f"[INFO] Plot saved to: {plot_path}")
+    
+    def save_performance_summary(self, model_path: str):
+        """Train/Val 최종 성능 요약 JSON 저장"""
+        import json
+        
+        output_dir = Path(model_path).parent
+        base_name = Path(model_path).stem
+        json_path = output_dir / f"{base_name}_performance.json"
+        
+        self.model.eval()
+        
+        # 1. Train set 평가
+        print("[INFO] Evaluating on train set...")
+        train_metrics = self._evaluate_full(self.train_loader, max_batches=None)
+        
+        # 2. Val set 평가
+        print("[INFO] Evaluating on validation set...")
+        val_metrics = self._evaluate_full(self.val_loader, max_batches=None)
+        
+        # 3. 결과 구성
+        summary = {
+            "model": base_name,
+            "best_epoch": len(self.history['train_loss']),
+            "best_val_loss": float(self.best_val_loss),
+            "train": train_metrics,
+            "validation": val_metrics
+        }
+        
+        # 4. JSON 저장
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        print(f"[INFO] Performance summary saved to: {json_path}")
+        
+        # 5. 콘솔 출력
+        print(f"\n{'='*60}")
+        print(f"Final Performance Summary")
+        print(f"{'='*60}")
+        print(f"Train - Overall: RMSE={train_metrics['overall']['rmse']:.4f}, "
+              f"MAE={train_metrics['overall']['mae']:.4f}, R²={train_metrics['overall']['r2']:.4f}")
+        print(f"Val   - Overall: RMSE={val_metrics['overall']['rmse']:.4f}, "
+              f"MAE={val_metrics['overall']['mae']:.4f}, R²={val_metrics['overall']['r2']:.4f}")
+        print(f"{'='*60}\n")
+    
+    def _evaluate_full(self, loader, max_batches=None):
+        """전체 horizon 및 horizon별 메트릭 계산"""
+        all_preds_by_h = {}  # {h: list of predictions}
+        all_trues_by_h = {}
+        all_preds = []
+        all_trues = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                
+                obs_coords = batch['obs_coords'].to(self.device)
+                target_coords = batch['target_coords'].to(self.device)
+                y_hist_obs = batch['y_hist_obs'].to(self.device)
+                y_fut = batch['y_fut'].to(self.device)
+                
+                H = y_fut.shape[1]
+                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+                
+                # Collect for overall metrics
+                mask = ~torch.isnan(y_fut)
+                if mask.sum() > 0:
+                    all_preds.append(y_pred[mask].cpu())
+                    all_trues.append(y_fut[mask].cpu())
+                
+                # Collect by horizon
+                B, H_batch, S = y_pred.shape[:3]
+                for h in range(H_batch):
+                    if h not in all_preds_by_h:
+                        all_preds_by_h[h] = []
+                        all_trues_by_h[h] = []
+                    
+                    mask_h = ~torch.isnan(y_fut[:, h])
+                    if mask_h.sum() > 0:
+                        all_preds_by_h[h].append(y_pred[:, h][mask_h].cpu())
+                        all_trues_by_h[h].append(y_fut[:, h][mask_h].cpu())
+        
+        # Overall metrics
+        y_pred_all = torch.cat(all_preds, dim=0)
+        y_true_all = torch.cat(all_trues, dim=0)
+        overall_metrics = compute_metrics(y_true_all, y_pred_all, per_horizon=False)
+        
+        # Per-horizon metrics
+        per_horizon_metrics = {}
+        for h in sorted(all_preds_by_h.keys()):
+            y_pred_h = torch.cat(all_preds_by_h[h], dim=0)
+            y_true_h = torch.cat(all_trues_by_h[h], dim=0)
+            metrics_h = compute_metrics(y_true_h, y_pred_h, per_horizon=False)
+            per_horizon_metrics[f"h={h+1}"] = {
+                "rmse": float(metrics_h['rmse']),
+                "mae": float(metrics_h['mae']),
+                "r2": float(metrics_h['r2'])
+            }
+        
+        return {
+            "overall": {
+                "rmse": float(overall_metrics['rmse']),
+                "mae": float(overall_metrics['mae']),
+                "r2": float(overall_metrics['r2'])
+            },
+            "per_horizon": per_horizon_metrics
+        }
+    
+    def visualize_predictions(self, model_path: str):
+        """Train/Val 예측 결과 시각화"""
+        output_dir = Path(model_path).parent
+        base_name = Path(model_path).stem
+        
+        self.model.eval()
+        
+        # 1. Train set에서 1-step ahead 예측
+        print("[INFO] Generating 1-step ahead predictions on train set...")
+        train_preds, train_trues, train_coords, train_times = self._collect_predictions_1step(
+            self.train_loader, max_batches=10
+        )
+        
+        # 2. Val set에서 1-step ahead 예측
+        print("[INFO] Generating 1-step ahead predictions on val set...")
+        val_preds, val_trues, val_coords, val_times = self._collect_predictions_1step(
+            self.val_loader, max_batches=None
+        )
+        
+        # 3. 시간별 공간 맵 시각화 (각 5개 시점)
+        print("[INFO] Creating spatial maps...")
+        self._plot_spatial_maps(
+            train_preds, train_trues, train_coords, train_times,
+            output_dir / f"{base_name}_train_spatial_maps.png",
+            title_prefix="Train (1-step ahead)"
+        )
+        self._plot_spatial_maps(
+            val_preds, val_trues, val_coords, val_times,
+            output_dir / f"{base_name}_val_spatial_maps.png",
+            title_prefix="Validation (1-step ahead)"
+        )
+        
+        # 4. 사이트별 시계열 플롯 (각 10개 사이트, 1-step ahead)
+        print("[INFO] Creating time series plots (1-step ahead)...")
+        self._plot_time_series(
+            train_preds, train_trues, train_coords, train_times,
+            output_dir / f"{base_name}_train_timeseries.png",
+            title_prefix="Train (1-step ahead)"
+        )
+        self._plot_time_series(
+            val_preds, val_trues, val_coords, val_times,
+            output_dir / f"{base_name}_val_timeseries.png",
+            title_prefix="Validation (1-step ahead)"
+        )
+        
+        # 5. Val 첫 시점에서 H-step ahead 예측
+        print("[INFO] Creating H-step ahead prediction plot...")
+        self._plot_h_step_ahead(
+            self.val_loader,
+            output_dir / f"{base_name}_val_h_step_ahead.png"
+        )
+        
+        print("[INFO] Prediction visualizations saved!")
+    
+    def _collect_predictions_1step(self, loader, max_batches=None):
+        """1-step ahead 예측값만 수집"""
+        # Dictionary to store predictions by time
+        pred_dict = {}
+        true_dict = {}
+        coords = None
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                
+                obs_coords = batch['obs_coords'].to(self.device)
+                target_coords = batch['target_coords'].to(self.device)
+                y_hist_obs = batch['y_hist_obs'].to(self.device)
+                y_fut = batch['y_fut'].to(self.device)
+                
+                H = y_fut.shape[1]
+                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+                
+                # Extract data
+                B, H, S = y_pred.shape[:3]
+                pred_np = y_pred.squeeze(-1).cpu().numpy()  # (B, H, S)
+                true_np = y_fut.squeeze(-1).cpu().numpy()
+                
+                if coords is None:
+                    coords = target_coords[0].cpu().numpy()  # (S, 2)
+                
+                # Store by time - ONLY h=0 (1-step ahead)
+                if 't0' in batch:
+                    t0_batch = batch['t0'].cpu().numpy()  # (B,)
+                    for b in range(B):
+                        t0 = t0_batch[b]
+                        t = t0  # Only t0 (h=0, 1-step ahead)
+                        # Only store first occurrence of each time point
+                        if t not in pred_dict:
+                            pred_dict[t] = pred_np[b, 0]  # h=0
+                            true_dict[t] = true_np[b, 0]
+        
+        # Convert to arrays sorted by time
+        times = sorted(pred_dict.keys())
+        all_preds = np.array([pred_dict[t] for t in times])  # (T, S)
+        all_trues = np.array([true_dict[t] for t in times])
+        times = np.array(times)
+        
+        return all_preds, all_trues, coords, times
+    
+    def _plot_spatial_maps(self, preds, trues, coords, times, save_path, title_prefix, n_times=5):
+        """시간별 공간 분포 맵 (비복원 샘플링)"""
+        T, S = preds.shape
+        
+        # Sample time indices (비복원추출)
+        if T > n_times:
+            time_indices = np.random.choice(T, n_times, replace=False)
+            time_indices = np.sort(time_indices)  # 시간 순서대로 정렬
+        else:
+            time_indices = np.arange(T)
+            n_times = T
+        
+        fig, axes = plt.subplots(2, n_times, figsize=(4*n_times, 8))
+        if n_times == 1:
+            axes = axes.reshape(2, 1)
+        
+        for i, t_idx in enumerate(time_indices):
+            # True values
+            ax = axes[0, i]
+            scatter = ax.scatter(coords[:, 0], coords[:, 1], c=trues[t_idx], 
+                               cmap='RdYlBu_r', s=20, vmin=trues.min(), vmax=trues.max())
+            ax.set_title(f'True (t={times[t_idx]})')
+            ax.set_xlabel('x')
+            ax.set_ylabel('y')
+            ax.set_aspect('equal')
+            plt.colorbar(scatter, ax=ax)
+            
+            # Predictions
+            ax = axes[1, i]
+            scatter = ax.scatter(coords[:, 0], coords[:, 1], c=preds[t_idx], 
+                               cmap='RdYlBu_r', s=20, vmin=trues.min(), vmax=trues.max())
+            ax.set_title(f'Pred (t={times[t_idx]})')
+            ax.set_xlabel('x')
+            ax.set_ylabel('y')
+            ax.set_aspect('equal')
+            plt.colorbar(scatter, ax=ax)
+        
+        fig.suptitle(f'{title_prefix} - Spatial Maps', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[INFO] Spatial maps saved to: {save_path}")
+    
+    def _plot_time_series(self, preds, trues, coords, times, save_path, title_prefix, n_sites=10):
+        """사이트별 시계열 플롯 (비복원 샘플링)"""
+        T, S = preds.shape
+        
+        # Sample site indices (비복원추출)
+        if S > n_sites:
+            site_indices = np.random.choice(S, n_sites, replace=False)
+            site_indices = np.sort(site_indices)
+        else:
+            site_indices = np.arange(S)
+            n_sites = S
+        
+        # Create subplots (2 rows × 5 cols)
+        n_cols = 5
+        n_rows = (n_sites + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
+        axes = axes.flatten() if n_sites > 1 else [axes]
+        
+        for i, site_idx in enumerate(site_indices):
+            ax = axes[i]
+            
+            # Plot true and pred with markers (no lines connecting across batches)
+            ax.plot(times, trues[:, site_idx], 'o-', color='blue', label='True', 
+                   linewidth=1.5, markersize=4, alpha=0.8)
+            ax.plot(times, preds[:, site_idx], 's--', color='red', label='Pred', 
+                   linewidth=1.5, markersize=3, alpha=0.8)
+            
+            ax.set_title(f'Site {site_idx} (x={coords[site_idx, 0]:.2f}, y={coords[site_idx, 1]:.2f})', 
+                        fontsize=10)
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Value')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(n_sites, len(axes)):
+            axes[i].axis('off')
+        
+        fig.suptitle(f'{title_prefix} - Time Series Predictions', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[INFO] Time series plot saved to: {save_path}")
+    
+    def _plot_h_step_ahead(self, val_loader, save_path, n_sites=10):
+        """Validation 첫 시점에서 H-step ahead 예측 플롯"""
+        # Get first batch
+        batch = next(iter(val_loader))
+        
+        obs_coords = batch['obs_coords'].to(self.device)
+        target_coords = batch['target_coords'].to(self.device)
+        y_hist_obs = batch['y_hist_obs'].to(self.device)
+        y_fut = batch['y_fut'].to(self.device)
+        
+        with torch.no_grad():
+            H = y_fut.shape[1]
+            y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+        
+        # Use first sample in batch
+        pred_np = y_pred[0].squeeze(-1).cpu().numpy()  # (H, S)
+        true_np = y_fut[0].squeeze(-1).cpu().numpy()
+        coords = target_coords[0].cpu().numpy()  # (S, 2)
+        
+        # Get t0
+        if 't0' in batch:
+            t0 = batch['t0'][0].item()
+            times = np.arange(t0, t0 + H)
+        else:
+            times = np.arange(H)
+        
+        S = pred_np.shape[1]
+        
+        # Sample sites (비복원추출)
+        if S > n_sites:
+            site_indices = np.random.choice(S, n_sites, replace=False)
+            site_indices = np.sort(site_indices)
+        else:
+            site_indices = np.arange(S)
+            n_sites = S
+        
+        # Create subplots (2 rows × 5 cols)
+        n_cols = 5
+        n_rows = (n_sites + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
+        axes = axes.flatten() if n_sites > 1 else [axes]
+        
+        for i, site_idx in enumerate(site_indices):
+            ax = axes[i]
+            
+            # Plot H-step ahead predictions
+            ax.plot(times, true_np[:, site_idx], 'o-', color='blue', label='True', 
+                   linewidth=2, markersize=6, alpha=0.8)
+            ax.plot(times, pred_np[:, site_idx], 's--', color='red', label='Pred', 
+                   linewidth=2, markersize=5, alpha=0.8)
+            
+            ax.set_title(f'Site {site_idx} (x={coords[site_idx, 0]:.2f}, y={coords[site_idx, 1]:.2f})', 
+                        fontsize=10)
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Value')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_xticks(times)
+        
+        # Hide unused subplots
+        for i in range(n_sites, len(axes)):
+            axes[i].axis('off')
+        
+        fig.suptitle(f'Validation - H-step Ahead Prediction (t0={times[0]})', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[INFO] H-step ahead plot saved to: {save_path}")
     
     def save_checkpoint(self, path: str, epoch: int, val_metrics: dict):
         """체크포인트 저장"""

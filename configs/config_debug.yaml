@@ -25,8 +25,14 @@ sampling:
 
 # 데이터 정규화
 preprocessing:
-  normalize_target: true
+  normalize_target: false
   normalize_coords: false
+
+# Covariates 설정
+covariates:
+  use_coords: true     # (x, y) 좌표를 covariates로 추가
+  use_time: true       # 시간 t를 covariates로 추가
+  time_encoding: linear # {linear, sinusoidal, learnable}
 
 # 학습 설정 (빠른 검증)
 training:

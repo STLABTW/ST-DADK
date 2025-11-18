@@ -46,13 +46,25 @@ class SiteEncoder(nn.Module):
         self.dropout = dropout
     
     def _build_mlp(self, input_dim: int):
-        """MLP 동적 생성"""
+        """MLP 동적 생성 with proper initialization"""
+        # 레이어 생성
+        linear1 = nn.Linear(input_dim, self.d_site)
+        linear2 = nn.Linear(self.d_site, self.d_site)
+        
+        # Xavier 초기화
+        nn.init.xavier_uniform_(linear1.weight)
+        nn.init.zeros_(linear1.bias)
+        nn.init.xavier_uniform_(linear2.weight)
+        nn.init.zeros_(linear2.bias)
+        
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, self.d_site),
-            nn.ReLU(),
+            linear1,
+            nn.LayerNorm(self.d_site),
+            nn.GELU(),
             nn.Dropout(self.dropout),
-            nn.Linear(self.d_site, self.d_site),
-            nn.ReLU(),
+            linear2,
+            nn.LayerNorm(self.d_site),
+            nn.GELU(),
             nn.Dropout(self.dropout)
         ).to(next(self.parameters()).device if len(list(self.parameters())) > 0 else 'cpu')
     
@@ -246,7 +258,7 @@ class CrossAttnHead(nn.Module):
         self.output_ffn = nn.Sequential(
             nn.Linear(self.d_tot, self.d_tot),
             nn.LayerNorm(self.d_tot),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(self.d_tot, 1)
         )

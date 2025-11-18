@@ -9,15 +9,15 @@ data:
 
 # 데이터 로딩 설정
 dataloader:
-  L: 24                # context length
-  H: 10                # forecast horizon
+  L: 10                # context length
+  H: 5                 # forecast horizon
   batch_size: 16
   num_workers: 0       # 윈도우에서 0 권장
-  val_ratio_t: 0.2     # train 구간의 마지막 20%를 검증으로 사용
+  val_ratio_t: 0.1     # train 구간의 마지막 10%를 검증으로 사용
 
 # 관측 샘플링
 sampling:
-  obs_fraction: 0.10   # 전체 사이트 중 10%만 관측으로 사용
+  obs_fraction: 0.20   # 전체 사이트 중 20%만 관측으로 사용
   obs_sampling: uniform  # {uniform, biased}
   time_varying_obs: false
   bias_sigma: 0.15
@@ -25,15 +25,24 @@ sampling:
 
 # 데이터 정규화
 preprocessing:
-  normalize_target: true
+  normalize_target: false
   normalize_coords: false
+
+# Covariates 설정
+covariates:
+  use_coords: true     # (x, y) 좌표를 covariates로 추가
+  use_time: true       # 시간 t를 covariates로 추가
+  time_encoding: linear # {linear, sinusoidal, learnable}
+  # linear: t를 그대로 사용
+  # sinusoidal: sin/cos으로 인코딩
+  # learnable: embedding layer 사용
 
 # 학습 설정
 training:
   epochs: 30
-  lr: 1.0e-3
-  weight_decay: 1.0e-5
-  patience: 8          # Early stopping patience
+  lr: 1.0e-2
+  weight_decay: 1.0e-4
+  patience: 5          # Early stopping patience
   device: cuda         # {cuda, cpu}
   seed: 42
   grad_clip: 1.0       # gradient clipping (0이면 사용 안 함)
