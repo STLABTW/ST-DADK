@@ -252,24 +252,89 @@ class KAUSTWindowDataset(Dataset):
         
         # 1. Context: [t0-L, t0)의 관측 사이트
         y_hist_obs = self.z_full[t0-self.L:t0, self.obs_indices]  # (L, n_obs)
-        # transpose 제거 - 이미 올바른 shape
         
-        # 2. Target: [t0, t0+H)의 관측 사이트만 (나머지는 어차피 NaN)
+        # 2. Target: [t0, t0+H)의 관측 사이트만
         y_fut = self.z_full[t0:t0+self.H, self.obs_indices]  # (H, n_obs)
-        # transpose 제거 - 이미 올바른 shape
         
-        # 3. 좌표 (관측 사이트만)
+        # 3. 좌표
         obs_coords = self.coords[self.obs_indices]  # (n_obs, 2)
         target_coords = self.coords[self.obs_indices]  # (n_obs, 2) - 동일!
         
-        # To torch
-        return {
+        # 4. Covariates 생성
+        result = {
             'obs_coords': torch.from_numpy(obs_coords).float(),      # (n_obs, 2)
-            'target_coords': torch.from_numpy(target_coords).float(), # (S, 2)
+            'target_coords': torch.from_numpy(target_coords).float(), # (n_obs, 2)
             'y_hist_obs': torch.from_numpy(y_hist_obs).float().unsqueeze(-1),  # (L, n_obs, 1)
-            'y_fut': torch.from_numpy(y_fut).float().unsqueeze(-1),  # (H, S, 1)
+            'y_fut': torch.from_numpy(y_fut).float().unsqueeze(-1),  # (H, n_obs, 1)
             't0': t0
         }
+        
+        # Covariates for history (관측 사이트)
+        if self.p_covariates > 0:
+            X_hist_list = []
+            
+            # 좌표 covariates: (n_obs, 2)
+            if self.use_coords_cov:
+                # (n_obs, 2)를 (L, n_obs, 2)로 확장
+                coords_cov = np.tile(obs_coords[np.newaxis, :, :], (self.L, 1, 1))
+                X_hist_list.append(coords_cov)
+            
+            # 시간 covariates
+            if self.use_time_cov:
+                # 시간 인덱스: [t0-L, t0) → 정규화된 시간
+                t_indices = np.arange(t0 - self.L, t0).astype(np.float32)
+                t_normalized = t_indices / self.T  # [0, 1] 범위로 정규화
+                
+                if self.time_encoding == 'sinusoidal':
+                    # sin/cos 인코딩
+                    t_sin = np.sin(2 * np.pi * t_normalized)  # (L,)
+                    t_cos = np.cos(2 * np.pi * t_normalized)  # (L,)
+                    # (L, n_obs, 2)
+                    t_cov = np.stack([
+                        np.tile(t_sin[:, np.newaxis], (1, self.n_obs)),
+                        np.tile(t_cos[:, np.newaxis], (1, self.n_obs))
+                    ], axis=-1)
+                else:  # linear
+                    # (L, n_obs, 1)
+                    t_cov = np.tile(t_normalized[:, np.newaxis, np.newaxis], (1, self.n_obs, 1))
+                
+                X_hist_list.append(t_cov)
+            
+            # Concatenate: (L, n_obs, p)
+            X_hist_obs = np.concatenate(X_hist_list, axis=-1)
+            result['X_hist_obs'] = torch.from_numpy(X_hist_obs).float()
+        
+        # Covariates for future (타겟 사이트)
+        if self.p_covariates > 0:
+            X_fut_list = []
+            
+            # 좌표 covariates
+            if self.use_coords_cov:
+                # (n_obs, 2) - 타겟도 동일한 좌표
+                X_fut_list.append(target_coords)
+            
+            # 시간 covariates for future
+            if self.use_time_cov:
+                # 미래 시점의 첫 번째 시간만 사용 (t0)
+                t_future = float(t0) / self.T  # 정규화
+                
+                if self.time_encoding == 'sinusoidal':
+                    # sin/cos 인코딩: (n_obs, 2)
+                    t_sin = np.sin(2 * np.pi * t_future)
+                    t_cos = np.cos(2 * np.pi * t_future)
+                    t_fut_cov = np.tile(np.array([[t_sin, t_cos]]), (self.n_obs, 1))
+                else:  # linear
+                    # (n_obs, 1)
+                    t_fut_cov = np.full((self.n_obs, 1), t_future, dtype=np.float32)
+                
+                X_fut_list.append(t_fut_cov)
+            
+            # Concatenate: (n_obs, p)
+            if len(X_fut_list) > 0:
+                X_fut_target = np.concatenate(X_fut_list, axis=-1)
+                result['X_fut_target'] = torch.from_numpy(X_fut_target).float()
+        
+        return result
 
 
 def create_dataloaders(
@@ -304,6 +369,11 @@ def create_dataloaders(
     batch_size = config['batch_size']
     num_workers = config.get('num_workers', 0)
     
+    # Covariates 설정 추출 (있으면)
+    use_coords_cov = config.get('use_coords_cov', False)
+    use_time_cov = config.get('use_time_cov', False)
+    time_encoding = config.get('time_encoding', 'linear')
+    
     T_tr = z_train.shape[0]
     
     # Target 기준 Train/Val 분할
@@ -314,12 +384,18 @@ def create_dataloaders(
     # Dataset 생성 (전체 z_train 공유, t0 범위만 다름)
     train_dataset = KAUSTWindowDataset(
         z_train, coords, obs_indices, L, H, stride=1,
-        t0_min=L, t0_max=t0_split  # t0 = [L, t0_split)
+        t0_min=L, t0_max=t0_split,  # t0 = [L, t0_split)
+        use_coords_cov=use_coords_cov,
+        use_time_cov=use_time_cov,
+        time_encoding=time_encoding
     )
     
     val_dataset = KAUSTWindowDataset(
         z_train, coords, obs_indices, L, H, stride=1,  # 시간순 분할이므로 stride=1
-        t0_min=t0_split, t0_max=t0_max + 1  # t0 = [t0_split, t0_max]
+        t0_min=t0_split, t0_max=t0_max + 1,  # t0 = [t0_split, t0_max]
+        use_coords_cov=use_coords_cov,
+        use_time_cov=use_time_cov,
+        time_encoding=time_encoding
     )
     
     # DataLoader

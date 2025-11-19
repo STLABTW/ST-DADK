@@ -70,9 +70,9 @@ class BasisEmbedding(nn.Module):
         Initialize centers on regular grids with corresponding bandwidths
         
         Regular grid setup:
-        - 5x5 grid (25 centers): theta = 0.10
-        - 9x9 grid (81 centers): theta = 0.15
-        - 12x12 grid (144 centers): theta = 0.45
+        - 5x5 grid (25 centers): theta = 2.5 * 0.25 = 0.625
+        - 9x9 grid (81 centers): theta = 2.5 * 0.125 = 0.3125
+        - 11x11 grid (121 centers): theta = 2.5 * 0.1 ≈ 0.25
         Total: 250 centers
         
         Returns:
@@ -84,9 +84,9 @@ class BasisEmbedding(nn.Module):
         
         # Grid configurations: (grid_size, theta)
         grid_configs = [
-            (5, 0.10),
-            (9, 0.15),
-            (12, 0.45)
+            (5, 0.625),
+            (9, 0.3125),
+            (11, 0.25)
         ]
         
         for grid_size, theta in grid_configs:

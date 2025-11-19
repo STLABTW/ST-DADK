@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+# Site-wise temporal encoding for better spatial variation!
 from stnf.models.stnf_xattn import create_model
 from stnf.dataio import load_kaust_csv, sample_observed_sites, create_dataloaders
 from stnf.utils import set_seed, compute_metrics, print_metrics
@@ -101,12 +102,21 @@ class Trainer:
             y_hist_obs = batch['y_hist_obs'].to(self.device)
             y_fut = batch['y_fut'].to(self.device)
             
+            # Covariates (optional)
+            X_hist_obs = batch.get('X_hist_obs')
+            if X_hist_obs is not None:
+                X_hist_obs = X_hist_obs.to(self.device)
+            
+            X_fut_target = batch.get('X_fut_target')
+            if X_fut_target is not None:
+                X_fut_target = X_fut_target.to(self.device)
+            
             B, L, n_obs, _ = y_hist_obs.shape
             H, S = y_fut.shape[1], y_fut.shape[2]
             
             # Forward
             self.optimizer.zero_grad()
-            y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+            y_pred = self.model(obs_coords, target_coords, y_hist_obs, H, X_hist_obs, X_fut_target)
             
             # Loss (ignore NaN)
             mask = ~torch.isnan(y_fut)
@@ -152,10 +162,19 @@ class Trainer:
                 y_hist_obs = batch['y_hist_obs'].to(self.device)
                 y_fut = batch['y_fut'].to(self.device)
                 
+                # Covariates (optional)
+                X_hist_obs = batch.get('X_hist_obs')
+                if X_hist_obs is not None:
+                    X_hist_obs = X_hist_obs.to(self.device)
+                
+                X_fut_target = batch.get('X_fut_target')
+                if X_fut_target is not None:
+                    X_fut_target = X_fut_target.to(self.device)
+                
                 H = y_fut.shape[1]
                 
                 # Forward
-                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H, X_hist_obs, X_fut_target)
                 
                 # Loss
                 mask = ~torch.isnan(y_fut)
@@ -395,8 +414,17 @@ class Trainer:
                 y_hist_obs = batch['y_hist_obs'].to(self.device)
                 y_fut = batch['y_fut'].to(self.device)
                 
+                # Covariates (optional)
+                X_hist_obs = batch.get('X_hist_obs')
+                if X_hist_obs is not None:
+                    X_hist_obs = X_hist_obs.to(self.device)
+                
+                X_fut_target = batch.get('X_fut_target')
+                if X_fut_target is not None:
+                    X_fut_target = X_fut_target.to(self.device)
+                
                 H = y_fut.shape[1]
-                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H, X_hist_obs, X_fut_target)
                 
                 # Collect for overall metrics
                 mask = ~torch.isnan(y_fut)
@@ -513,8 +541,17 @@ class Trainer:
                 y_hist_obs = batch['y_hist_obs'].to(self.device)
                 y_fut = batch['y_fut'].to(self.device)
                 
+                # Covariates (optional)
+                X_hist_obs = batch.get('X_hist_obs')
+                if X_hist_obs is not None:
+                    X_hist_obs = X_hist_obs.to(self.device)
+                
+                X_fut_target = batch.get('X_fut_target')
+                if X_fut_target is not None:
+                    X_fut_target = X_fut_target.to(self.device)
+                
                 H = y_fut.shape[1]
-                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+                y_pred = self.model(obs_coords, target_coords, y_hist_obs, H, X_hist_obs, X_fut_target)
                 
                 # Extract data
                 B, H, S = y_pred.shape[:3]
@@ -642,9 +679,18 @@ class Trainer:
         y_hist_obs = batch['y_hist_obs'].to(self.device)
         y_fut = batch['y_fut'].to(self.device)
         
+        # Covariates (optional)
+        X_hist_obs = batch.get('X_hist_obs')
+        if X_hist_obs is not None:
+            X_hist_obs = X_hist_obs.to(self.device)
+        
+        X_fut_target = batch.get('X_fut_target')
+        if X_fut_target is not None:
+            X_fut_target = X_fut_target.to(self.device)
+        
         with torch.no_grad():
             H = y_fut.shape[1]
-            y_pred = self.model(obs_coords, target_coords, y_hist_obs, H)
+            y_pred = self.model(obs_coords, target_coords, y_hist_obs, H, X_hist_obs, X_fut_target)
         
         # Use first sample in batch
         pred_np = y_pred[0].squeeze(-1).cpu().numpy()  # (H, S)
@@ -757,7 +803,11 @@ def main():
         'bias_sigma': config['sampling']['bias_sigma'],
         'bias_temp': config['sampling']['bias_temp'],
         'normalize_target': config['preprocessing']['normalize_target'],
-        'normalize_coords': config['preprocessing']['normalize_coords']
+        'normalize_coords': config['preprocessing']['normalize_coords'],
+        # Covariates 설정 추가
+        'use_coords_cov': config['covariates'].get('use_coords', False),
+        'use_time_cov': config['covariates'].get('use_time', False),
+        'time_encoding': config['covariates'].get('time_encoding', 'linear')
     }
     
     cfg_train = {
@@ -834,6 +884,25 @@ def main():
         cfg_data,
         val_ratio=cfg_data.get('val_ratio_t', 0.2)
     )
+    
+    # Calculate p_covariates from config
+    p_covariates = 0
+    if cfg_data.get('use_coords_cov', False):
+        p_covariates += 2  # (x, y)
+    if cfg_data.get('use_time_cov', False):
+        if cfg_data.get('time_encoding', 'linear') == 'sinusoidal':
+            p_covariates += 2  # (sin(t), cos(t))
+        else:
+            p_covariates += 1  # t
+    
+    # Add p_covariates to model config
+    cfg_train['p_covariates'] = p_covariates
+    cfg_train['use_basis_embedding'] = config['model']['use_basis_embedding']
+    cfg_train['basis_k'] = config['model']['basis_k']
+    cfg_train['basis_initialize'] = config['model']['basis_initialize']
+    cfg_train['basis_learnable'] = config['model']['basis_learnable']
+    
+    print(f"[INFO] Covariates dimension: p={p_covariates}")
     
     # Create model
     print("\nCreating model...")
