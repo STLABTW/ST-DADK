@@ -17,6 +17,7 @@ import torch.optim as optim
 from pathlib import Path
 import sys
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib
@@ -49,12 +50,14 @@ def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
         return None
     
     elif pattern == 'corner':
-        # Probability decreases with distance from (0,0)
-        # p(x,y) ∝ exp(-intensity * ||[x,y]||^2)
+        # Heavy-tailed distribution with sharp peak at (0,0)
+        # p(x,y) ∝ 1 / (1 + intensity * ||[x,y]||²)^2
+        # This is a Cauchy-like distribution with heavier tails than Gaussian
         def obs_prob_fn(coord):
             x, y = coord
             dist_sq = x**2 + y**2
-            prob = np.exp(-intensity * dist_sq)
+            # Power law decay: sharper peak, longer tail
+            prob = 1.0 / (1.0 + intensity * dist_sq)**2
             return prob
         return obs_prob_fn
     
@@ -249,10 +252,10 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         lr = float(config.get('lr', 1e-3))
         optimizer = optim.AdamW([
             {'params': mlp_params, 'lr': lr},
-            {'params': basis_params, 'lr': lr * 0.1}  # 10x smaller LR
+            {'params': basis_params, 'lr': lr * 0.5}  # 2x smaller LR
         ], weight_decay=float(config.get('weight_decay', 1e-5)))
-        
-        print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*0.1:.2e})")
+
+        print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*0.5:.2e})")
     else:
         # Fixed basis: only optimize MLP parameters
         # model.spatial_basis has no parameters when learnable=False (uses buffers)
@@ -771,59 +774,46 @@ def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_di
     print(f"Observation pattern plot saved to {save_path}")
 
 
-def main():
-    # Start timing
+def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True):
+    """
+    Run a single experiment
+    
+    Args:
+        config: configuration dictionary
+        experiment_id: experiment ID (1, 2, ..., M)
+        output_dir: output directory for this experiment
+        device: torch device
+        verbose: whether to print detailed logs
+    
+    Returns:
+        results: dictionary containing all results
+    """
     start_time = time.time()
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/config_st_interp.yaml')
-    parser.add_argument('--data_file', type=str, default=None)
-    parser.add_argument('--seed', type=int, default=None)
-    args = parser.parse_args()
+    if verbose:
+        print("\n" + "="*70)
+        print(f"EXPERIMENT {experiment_id}")
+        print("="*70)
     
-    # Load config
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    # Override config with command line arguments
-    if args.data_file is not None:
-        config['data_file'] = args.data_file
-    if args.seed is not None:
-        config['seed'] = args.seed
-    
-    # Create output directory with date/time
-    now = datetime.now()
-    date_str = now.strftime('%Y%m%d')
-    time_str = now.strftime('%H%M%S')
-    output_dir = Path('results') / date_str / time_str
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nOutput directory: {output_dir}")
-    
-    # Save config
-    with open(output_dir / 'config.yaml', 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    
-    print("="*50)
-    print("Training Spatio-Temporal Interpolation Model")
-    print("="*50)
-    
-    # Set seed
-    set_seed(config.get('seed', 42))
-    
-    # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    # Set seed for this experiment
+    experiment_seed = config.get('base_seed', 42) + experiment_id - 1
+    set_seed(experiment_seed)
+    if verbose:
+        print(f"Experiment seed: {experiment_seed}")
     
     # Load data
-    print("Loading data...")
+    if verbose:
+        print("\nLoading data...")
     z_full, coords, metadata = load_kaust_csv_single(
         config.get('data_file', 'data/2b/2b_7.csv'),
         normalize=config.get('normalize_target', False)
     )
-    print(f"Full data shape: {z_full.shape}, Coords: {coords.shape}")
+    if verbose:
+        print(f"Full data shape: {z_full.shape}, Coords: {coords.shape}")
     
     # Sample observations (train + valid)
-    print("\nSampling observations...")
+    if verbose:
+        print("\nSampling observations...")
     obs_method = config.get('obs_method', 'site-wise')
     obs_ratio = config.get('obs_ratio', 0.5)
     
@@ -975,6 +965,8 @@ def main():
     
     # Save results
     results = {
+        'experiment_id': experiment_id,
+        'experiment_seed': experiment_seed,
         'config': config,
         'metrics': {
             'train': train_metrics,
@@ -985,7 +977,7 @@ def main():
         'total_time_seconds': total_time,
         'total_time_formatted': f"{int(total_time//3600):02d}:{int((total_time%3600)//60):02d}:{int(total_time%60):02d}",
         'model_parameters': sum(p.numel() for p in model.parameters()),
-        'timestamp': now.strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
     
     save_results(results, output_dir)
@@ -1010,12 +1002,262 @@ def main():
     plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_times=3)
     plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir)
     
-    print("\n" + "="*50)
-    print("Training Complete!")
+    print("\n" + "="*70)
+    print(f"EXPERIMENT {experiment_id} COMPLETE!")
     print(f"Total Time: {results['total_time_formatted']}")
     print(f"Results saved to: {output_dir}")
-    print("="*50)
-    print("="*50)
+    print("="*70)
+    
+    return results
+
+
+def aggregate_results(all_results: list, summary_dir: Path):
+    """
+    Aggregate results from multiple experiments and compute statistics
+    
+    Args:
+        all_results: list of result dictionaries from each experiment
+        summary_dir: directory to save summary statistics
+    """
+    print("\n" + "="*70)
+    print("AGGREGATING RESULTS")
+    print("="*70)
+    
+    n_experiments = len(all_results)
+    
+    # Extract metrics from all experiments
+    metrics_data = {
+        'train_mse': [],
+        'train_mae': [],
+        'train_rmse': [],
+        'valid_mse': [],
+        'valid_mae': [],
+        'valid_rmse': [],
+        'test_mse': [],
+        'test_mae': [],
+        'test_rmse': [],
+        'total_time_seconds': []
+    }
+    
+    for result in all_results:
+        metrics_data['train_mse'].append(result['metrics']['train']['mse'])
+        metrics_data['train_mae'].append(result['metrics']['train']['mae'])
+        metrics_data['train_rmse'].append(result['metrics']['train']['rmse'])
+        metrics_data['valid_mse'].append(result['metrics']['valid']['mse'])
+        metrics_data['valid_mae'].append(result['metrics']['valid']['mae'])
+        metrics_data['valid_rmse'].append(result['metrics']['valid']['rmse'])
+        metrics_data['test_mse'].append(result['metrics']['test']['mse'])
+        metrics_data['test_mae'].append(result['metrics']['test']['mae'])
+        metrics_data['test_rmse'].append(result['metrics']['test']['rmse'])
+        metrics_data['total_time_seconds'].append(result['total_time_seconds'])
+    
+    # Compute statistics
+    summary = {
+        'n_experiments': n_experiments,
+        'statistics': {}
+    }
+    
+    for metric_name, values in metrics_data.items():
+        values_array = np.array(values)
+        summary['statistics'][metric_name] = {
+            'mean': float(np.mean(values_array)),
+            'std': float(np.std(values_array)),
+            'min': float(np.min(values_array)),
+            'max': float(np.max(values_array)),
+            'median': float(np.median(values_array)),
+            'values': [float(v) for v in values]
+        }
+    
+    # Save summary
+    summary_file = summary_dir / 'summary_statistics.json'
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\nSummary saved to: {summary_file}")
+    
+    # Print summary table
+    print("\n" + "="*70)
+    print("SUMMARY STATISTICS (across {} experiments)".format(n_experiments))
+    print("="*70)
+    print(f"{'Metric':<20} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+    print("-"*70)
+    
+    for metric_name in ['test_mse', 'test_mae', 'test_rmse', 'valid_mse', 'valid_mae', 'valid_rmse']:
+        stats = summary['statistics'][metric_name]
+        print(f"{metric_name:<20} {stats['mean']:<12.6f} {stats['std']:<12.6f} "
+              f"{stats['min']:<12.6f} {stats['max']:<12.6f}")
+    
+    print("\n" + f"{'total_time (sec)':<20} {summary['statistics']['total_time_seconds']['mean']:<12.2f} "
+          f"{summary['statistics']['total_time_seconds']['std']:<12.2f} "
+          f"{summary['statistics']['total_time_seconds']['min']:<12.2f} "
+          f"{summary['statistics']['total_time_seconds']['max']:<12.2f}")
+    
+    # Create detailed CSV for easy analysis
+    import pandas as pd
+    
+    df_data = {
+        'experiment_id': [r['experiment_id'] for r in all_results],
+        'experiment_seed': [r['experiment_seed'] for r in all_results],
+    }
+    
+    for metric_name in metrics_data.keys():
+        df_data[metric_name] = metrics_data[metric_name]
+    
+    df = pd.DataFrame(df_data)
+    csv_file = summary_dir / 'all_experiments.csv'
+    df.to_csv(csv_file, index=False)
+    print(f"\nDetailed results saved to: {csv_file}")
+    
+    return summary
+
+
+def main():
+    """Main function to run multiple experiments"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/config_st_interp.yaml')
+    parser.add_argument('--data_file', type=str, default=None)
+    parser.add_argument('--n_experiments', type=int, default=None)
+    parser.add_argument('--base_seed', type=int, default=None)
+    parser.add_argument('--parallel', action='store_true', help='Run experiments in parallel')
+    parser.add_argument('--n_jobs', type=int, default=-1, help='Number of parallel jobs (-1 for all CPUs, 0 for sequential)')
+    args = parser.parse_args()
+    
+    # Load config
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    # Override config with command line arguments
+    if args.data_file is not None:
+        config['data_file'] = args.data_file
+    if args.n_experiments is not None:
+        config['n_experiments'] = args.n_experiments
+    if args.base_seed is not None:
+        config['base_seed'] = args.base_seed
+    
+    # Get experiment settings
+    n_experiments = config.get('n_experiments', 1)
+    parallel = args.parallel or config.get('parallel', False)
+    n_jobs = args.n_jobs if args.n_jobs != -1 else config.get('n_jobs', -1)
+    
+    # Create base output directory with date/time
+    now = datetime.now()
+    date_str = now.strftime('%Y%m%d')
+    time_str = now.strftime('%H%M%S')
+    base_output_dir = Path('results') / date_str / time_str
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save config to base directory
+    with open(base_output_dir / 'config.yaml', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    print("\n" + "="*70)
+    print("MULTIPLE EXPERIMENT RUNNER")
+    print("="*70)
+    print(f"Number of experiments: {n_experiments}")
+    print(f"Base output directory: {base_output_dir}")
+    print(f"Base seed: {config.get('base_seed', 42)}")
+    print(f"Parallel execution: {parallel}")
+    if parallel:
+        if n_jobs == -1:
+            import multiprocessing
+            n_jobs = multiprocessing.cpu_count()
+        print(f"Number of parallel jobs: {n_jobs}")
+    print("="*70)
+    
+    # Device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}\n")
+    
+    # Run experiments
+    all_results = []
+    
+    if parallel and n_experiments > 1:
+        # Parallel execution using joblib
+        from joblib import Parallel, delayed
+        import warnings
+        import sys
+        import io
+        
+        def run_experiment_wrapper(exp_id):
+            """Wrapper for parallel execution with suppressed output"""
+            exp_output_dir = base_output_dir / str(exp_id)
+            exp_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Suppress all output during parallel execution
+            import os
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            
+            # Redirect to devnull
+            devnull = open(os.devnull, 'w')
+            sys.stdout = devnull
+            sys.stderr = devnull
+            
+            # Suppress matplotlib
+            matplotlib.use('Agg')
+            
+            # Suppress warnings
+            warnings.filterwarnings('ignore')
+            
+            try:
+                result = run_single_experiment(config, exp_id, exp_output_dir, device, verbose=False)
+                return result
+            except Exception as e:
+                # Restore output to show errors
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                devnull.close()
+                print(f"\n❌ Experiment {exp_id} FAILED: {str(e)[:100]}")
+                return None
+            finally:
+                # Restore output
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                devnull.close()
+        
+        print(f"Running {n_experiments} experiments in parallel with {n_jobs} jobs...")
+        print("(Detailed logs suppressed during parallel execution)\n")
+        
+        # Run in parallel with progress bar
+        results_list = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(run_experiment_wrapper)(i) for i in range(1, n_experiments + 1)
+        )
+        
+        # Filter out None (failed experiments)
+        all_results = [r for r in results_list if r is not None]
+        
+        print(f"\n✅ Completed {len(all_results)}/{n_experiments} experiments successfully")
+        
+    else:
+        # Sequential execution with full logging
+        print(f"Running {n_experiments} experiments sequentially...\n")
+        
+        for i in range(1, n_experiments + 1):
+            # Create experiment-specific output directory
+            exp_output_dir = base_output_dir / str(i)
+            exp_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Run experiment with full logging
+            try:
+                results = run_single_experiment(config, i, exp_output_dir, device, verbose=True)
+                all_results.append(results)
+            except Exception as e:
+                print(f"\n❌ Experiment {i} FAILED with error: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+    
+    # Aggregate results if multiple experiments
+    if n_experiments > 1 and len(all_results) > 0:
+        summary_dir = base_output_dir / 'summary'
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        aggregate_results(all_results, summary_dir)
+    
+    print("\n" + "="*70)
+    print("ALL EXPERIMENTS COMPLETE!")
+    print(f"Successful experiments: {len(all_results)} / {n_experiments}")
+    print(f"Results directory: {base_output_dir}")
+    print("="*70)
 
 
 if __name__ == '__main__':
