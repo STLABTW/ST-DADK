@@ -27,6 +27,12 @@ outputs/
 *.pth
 *.ckpt
 
+# Results files
+results/
+*.csv
+*.png
+*.json
+
 # Data files (optional - uncomment if you want to ignore data)
 # data/
 

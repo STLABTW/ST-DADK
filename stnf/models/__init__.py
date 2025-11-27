@@ -1,6 +1,6 @@
 """
 STNF Models
 """
-from .stnf_xattn import STNFXAttn, create_model
+from .st_interp import STInterpMLP, create_model
 
-__all__ = ['STNFXAttn', 'create_model']
+__all__ = ['STInterpMLP', 'create_model']

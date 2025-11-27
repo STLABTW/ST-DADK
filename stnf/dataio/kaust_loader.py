@@ -16,6 +16,66 @@ from typing import Tuple, Dict, Optional, List
 from pathlib import Path
 
 
+def load_kaust_csv_single(
+    data_path: str,
+    normalize: bool = True
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    KAUST CSV 파일 로딩 (단일 파일)
+    
+    Args:
+        data_path: csv 경로
+        normalize: z 값 정규화 여부
+        
+    Returns:
+        z_data: (T, S) - 전체 시계열
+        coords: (S, 2) - 사이트 좌표 [x, y], already in [0,1]
+        metadata: dict - 정규화 통계 등
+    """
+    # Load CSV
+    df = pd.read_csv(data_path)
+    print(f"[INFO] Loaded data: {len(df)} rows")
+    
+    # 1. 사이트 인덱스 생성
+    all_coords = df[['x', 'y']].drop_duplicates().reset_index(drop=True)
+    S = len(all_coords)
+    print(f"[INFO] Total sites: {S}")
+    
+    # 사이트 매핑: (x, y) → index
+    site_to_idx = {
+        (row['x'], row['y']): idx 
+        for idx, row in all_coords.iterrows()
+    }
+    
+    # 좌표 배열: (S, 2), already in [0,1]^2
+    coords = all_coords[['x', 'y']].values.astype(np.float32)
+    
+    # 2. 시간 인덱스
+    t_vals = df['t'].values
+    T = int(t_vals.max())
+    print(f"[INFO] Time range: 1 ~ {T}")
+    
+    # 3. 시계열 매트릭스 재구성: (T, S)
+    z_data = np.full((T, S), np.nan, dtype=np.float32)
+    for _, row in df.iterrows():
+        t_idx = int(row['t']) - 1  # 0-based indexing
+        site_idx = site_to_idx[(row['x'], row['y'])]
+        z_data[t_idx, site_idx] = row['z']
+    
+    # 4. 정규화 (z값만)
+    metadata = {}
+    if normalize:
+        z_flat = z_data[~np.isnan(z_data)]
+        z_mean = z_flat.mean()
+        z_std = z_flat.std()
+        z_data = (z_data - z_mean) / z_std
+        metadata['z_mean'] = z_mean
+        metadata['z_std'] = z_std
+        print(f"[INFO] Normalized z: mean={z_mean:.4f}, std={z_std:.4f}")
+    
+    return z_data, coords, metadata
+
+
 def load_kaust_csv(
     train_path: str,
     test_path: str,
