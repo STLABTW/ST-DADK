@@ -236,7 +236,7 @@ def main():
         'spatial_init_method': ['uniform', 'gmm'],
         'spatial_learnable': [True, False],
         'obs_method': ['site-wise', 'random'],
-        'obs_ratio': [0.05, 0.25],
+        'obs_ratio': [0.05],
         'obs_spatial_pattern': ['corner', 'uniform'],
     }
     

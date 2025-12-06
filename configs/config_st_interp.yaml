@@ -39,10 +39,10 @@ warmup_epochs: 5                  # Number of warmup epochs (linear LR increase 
 num_workers: 0                    # DataLoader workers per experiment (0=single process, 2-4=recommended for CPU)
 
 # Experiment settings
-n_experiments: 30                 # Number of repeated experiments (M)
+n_experiments: 20                 # Number of repeated experiments (M)
 base_seed: 42                     # Base seed (each experiment uses base_seed + i)
 parallel: true                    # Run experiments in parallel
-n_jobs: 30                        # Number of parallel jobs
+n_jobs: 4                         # Number of parallel jobs (32 cores / 8 configs = 4)
 
 # Device
 device: cpu
