@@ -48,14 +48,17 @@ class SpatialBasisEmbedding(nn.Module):
             raise ValueError(f"Unknown init_method: {init_method}")
         
         if learnable:
+            # Learnable centers: no constraints, penalty applied in training
             self.centers = nn.Parameter(centers)
+            # Store initial centers for movement penalty
+            self.register_buffer('centers_init', centers.clone())
             # Store log(bandwidth) to ensure positivity: bandwidth = exp(log_bandwidth)
             self.log_bandwidths = nn.Parameter(torch.log(bandwidths))
         else:
             self.register_buffer('centers', centers)
             self.register_buffer('_bandwidths', bandwidths)  # Use _ prefix to avoid property conflict
         
-        self.k = self.centers.shape[0]
+        self.k = centers.shape[0]
     
     @property
     def bandwidths(self):
@@ -77,7 +80,14 @@ class SpatialBasisEmbedding(nn.Module):
             # Regular grid in [0,1]^2 (including boundaries)
             x = torch.linspace(0, 1, side)
             y = torch.linspace(0, 1, side)
-            xx, yy = torch.meshgrid(x, y, indexing='ij')
+            
+            # PyTorch < 1.10 compatibility (no indexing parameter)
+            try:
+                xx, yy = torch.meshgrid(x, y, indexing='ij')
+            except TypeError:
+                # Old PyTorch version - default behavior is 'ij'
+                xx, yy = torch.meshgrid(x, y)
+            
             centers = torch.stack([xx.flatten(), yy.flatten()], dim=-1)  # (k, 2)
             
             # Bandwidth: 2.5 × grid spacing
@@ -107,6 +117,15 @@ class SpatialBasisEmbedding(nn.Module):
         centers_list = []
         bandwidths_list = []
         
+        # **SPEEDUP 1: Subsample training data for faster GMM fitting**
+        max_samples_for_gmm = 50000  # Limit samples for GMM (much faster!)
+        if len(train_coords) > max_samples_for_gmm:
+            print(f"  Subsampling {max_samples_for_gmm}/{len(train_coords)} points for GMM initialization")
+            indices = np.random.choice(len(train_coords), max_samples_for_gmm, replace=False)
+            train_coords_sampled = train_coords[indices]
+        else:
+            train_coords_sampled = train_coords
+        
         # Compute uniform bandwidth reference for each resolution (for clipping)
         uniform_bandwidths = []
         for k in self.n_centers:
@@ -116,19 +135,20 @@ class SpatialBasisEmbedding(nn.Module):
             uniform_bandwidths.append(uniform_bw)
         
         # Convert to float64 for better numerical stability
-        train_coords_64 = train_coords.astype(np.float64)
+        train_coords_64 = train_coords_sampled.astype(np.float64)
         
         for i, n_components in enumerate(self.n_centers):
+            # **SPEEDUP 2: Reduced iterations and initializations**
             # Fit GMM with spherical covariance (σ²I)
             gmm = GaussianMixture(
                 n_components=n_components,
                 covariance_type='spherical',  # σ²I form - simplest
                 random_state=42,
-                max_iter=250,
-                n_init=5,
+                max_iter=100,
+                n_init=3,
                 init_params='k-means++',  # Better initialization
-                reg_covar=1e-6,  # Regularization to avoid singular covariance
-                tol=1e-4,
+                reg_covar=1e-6,
+                tol=1e-3,
                 verbose=0
             )
             gmm.fit(train_coords_64)
@@ -142,10 +162,10 @@ class SpatialBasisEmbedding(nn.Module):
             stds = np.sqrt(gmm.covariances_)  # (n_components,)
             bandwidths_raw = 4.23 * 2.5 * stds  # (n_components,)
             
-            # Clip to [0.5 × uniform_bw, 4.0 × uniform_bw]
+            # Clip to [0.25 × uniform_bw, Inf]
             uniform_bw = uniform_bandwidths[i]
-            bw_min = 0.5 * uniform_bw
-            bw_max = 4.0 * uniform_bw
+            bw_min = 0.25 * uniform_bw
+            bw_max = float('inf')
             bandwidths_clipped = np.clip(bandwidths_raw, bw_min, bw_max)
             
             bandwidths = torch.from_numpy(bandwidths_clipped).float()  # (n_components,)
@@ -177,6 +197,61 @@ class SpatialBasisEmbedding(nn.Module):
         phi = torch.pow(1 - r, 6) * (35 * r**2 + 18 * r + 3) / 3
         
         return phi
+    
+    def compute_domain_penalty(self, domain_bounds=(0.0, 1.0)):
+        """
+        Compute L2 penalty for centers outside the domain [0,1]^2
+        
+        Only applies penalty to centers that violate boundaries:
+        - penalty = sum of squared distances from boundary for out-of-bound centers
+        - No penalty for centers inside domain
+        
+        Args:
+            domain_bounds: (min, max) tuple for domain boundaries
+            
+        Returns:
+            penalty: scalar tensor (0 if all centers are inside domain)
+        """
+        if not self.learnable:
+            return torch.tensor(0.0, device=self.centers.device)
+        
+        min_bound, max_bound = domain_bounds
+        
+        # Compute violations for each dimension
+        # Lower bound violations: max(0, min_bound - centers)
+        lower_violations = torch.clamp(min_bound - self.centers, min=0.0)
+        
+        # Upper bound violations: max(0, centers - max_bound)
+        upper_violations = torch.clamp(self.centers - max_bound, min=0.0)
+        
+        # Total violation per center (L2 distance from boundary)
+        violations = lower_violations + upper_violations  # (k, 2)
+        
+        # L2 penalty: sum of squared violations
+        penalty = torch.sum(violations ** 2)
+        
+        return penalty
+    
+    def compute_movement_penalty(self):
+        """
+        Compute L2 penalty for centers moving away from initial positions
+        
+        Penalty = sum of squared distances from initial positions
+        This encourages centers to stay close to their initialization
+        
+        Returns:
+            penalty: scalar tensor (0 if centers haven't moved or not learnable)
+        """
+        if not self.learnable:
+            return torch.tensor(0.0, device=self.centers.device)
+        
+        # Compute L2 distance from initial positions
+        movement = self.centers - self.centers_init  # (k, 2)
+        
+        # Sum of squared movements
+        penalty = torch.sum(movement ** 2)
+        
+        return penalty
 
 
 class TemporalBasisEmbedding(nn.Module):
@@ -289,6 +364,24 @@ class STInterpMLP(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         
         self.mlp = nn.Sequential(*layers)
+    
+    def compute_domain_penalty(self):
+        """
+        Compute penalty for basis centers outside domain [0,1]^2
+        
+        Returns:
+            penalty: scalar tensor
+        """
+        return self.spatial_basis.compute_domain_penalty()
+    
+    def compute_movement_penalty(self):
+        """
+        Compute penalty for basis centers moving away from initial positions
+        
+        Returns:
+            penalty: scalar tensor
+        """
+        return self.spatial_basis.compute_movement_penalty()
     
     def forward(self, X: torch.Tensor, coords: torch.Tensor, t: torch.Tensor):
         """

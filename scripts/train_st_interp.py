@@ -90,8 +90,13 @@ def sample_observations(z_data, coords, obs_method='site-wise', obs_ratio=0.5,
     
     # Compute observation probabilities per site
     if obs_prob_fn is not None:
-        # Apply function to each coordinate
-        obs_probs = np.array([obs_prob_fn(coords[i]) for i in range(S)])
+        # Apply function to each coordinate to get relative weights
+        obs_weights = np.array([obs_prob_fn(coords[i]) for i in range(S)])
+        # Normalize and scale by obs_ratio to get actual probabilities
+        obs_weights_normalized = obs_weights / obs_weights.mean()
+        obs_probs = obs_weights_normalized * obs_ratio
+        # Clip to [0, 1] range
+        obs_probs = np.clip(obs_probs, 0, 1)
     else:
         # Uniform probability
         obs_probs = np.ones(S) * obs_ratio
@@ -100,8 +105,8 @@ def sample_observations(z_data, coords, obs_method='site-wise', obs_ratio=0.5,
         # Select obs_ratio fraction of sites, observe all times
         # Use obs_probs as sampling weights
         n_obs_sites = int(S * obs_ratio)
-        obs_probs_normalized = obs_probs / obs_probs.sum()
-        obs_sites = np.random.choice(S, size=n_obs_sites, replace=False, p=obs_probs_normalized)
+        obs_weights_normalized = obs_probs / obs_probs.sum()
+        obs_sites = np.random.choice(S, size=n_obs_sites, replace=False, p=obs_weights_normalized)
         
         obs_mask = np.zeros((T, S), dtype=bool)
         obs_mask[:, obs_sites] = True
@@ -252,10 +257,14 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         lr = float(config.get('lr', 1e-3))
         optimizer = optim.AdamW([
             {'params': mlp_params, 'lr': lr},
-            {'params': basis_params, 'lr': lr * 0.5}  # 2x smaller LR
+            {'params': basis_params, 'lr': lr * 0.2}  # 5x smaller LR
         ], weight_decay=float(config.get('weight_decay', 1e-5)))
+        
+        # Store initial learning rates for warmup
+        for param_group in optimizer.param_groups:
+            param_group['initial_lr'] = param_group['lr']
 
-        print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*0.5:.2e})")
+        print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*0.2:.2e})")
     else:
         # Fixed basis: only optimize MLP parameters
         # model.spatial_basis has no parameters when learnable=False (uses buffers)
@@ -268,15 +277,29 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             weight_decay=float(config.get('weight_decay', 1e-5))
         )
         
+        # Store initial learning rates for warmup
+        for param_group in optimizer.param_groups:
+            param_group['initial_lr'] = param_group['lr']
+        
         print(f"Spatial basis: FIXED (only MLP trained, lr={lr:.2e})")
+    
+    # Warmup settings
+    warmup_epochs = config.get('warmup_epochs', 0)
+    warmup_steps = warmup_epochs * len(train_loader) if warmup_epochs > 0 else 0
     
     # Scheduler
     scheduler = None
     if config.get('scheduler') == 'cosine':
+        eta_min = lr * 0.3  # Minimum LR = 30% of initial LR
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config.get('epochs', 100)
+            T_max=config.get('epochs', 100),
+            eta_min=eta_min
         )
+        print(f"Cosine scheduler: lr={lr:.2e} → eta_min={eta_min:.2e} (10% of initial)")
+    
+    if warmup_steps > 0:
+        print(f"Using warmup: {warmup_epochs} epochs ({warmup_steps} steps)")
     
     criterion = nn.MSELoss()
     epochs = config.get('epochs', 100)
@@ -287,17 +310,19 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     history = {
         'train_loss': [],
         'val_loss': [],
-        'val_rmse': []
+        'val_rmse': [],
+        'lr': []
     }
     
     best_model_path = output_dir / 'model_best.pt'
+    global_step = 0  # Track global training step for warmup
     
     for epoch in range(epochs):
         # Training
         model.train()
         train_loss = 0.0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch_idx, batch in enumerate(train_loader):
             X = batch['X'].to(device)
             coords = batch['coords'].to(device)
             t = batch['t'].to(device)
@@ -308,14 +333,37 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             # Forward pass
             y_pred = model(X, coords, t)
             
-            # Loss
+            # Main loss (MSE)
             loss = criterion(y_pred, y)
+            
+            # Add regularization penalties for learnable basis centers
+            if config.get('spatial_learnable', False):
+                # Domain penalty: prevent centers from going outside [0,1]^2
+                domain_penalty_weight = config.get('domain_penalty_weight', 0.0)
+                if domain_penalty_weight > 0:
+                    domain_penalty = model.compute_domain_penalty()
+                    loss = loss + domain_penalty_weight * domain_penalty
+                
+                # Movement penalty: prevent centers from moving too far from initialization
+                movement_penalty_weight = config.get('movement_penalty_weight', 0.0)
+                if movement_penalty_weight > 0:
+                    movement_penalty = model.compute_movement_penalty()
+                    loss = loss + movement_penalty_weight * movement_penalty
+            
             loss.backward()
             
             if config.get('grad_clip', 0) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
             
             optimizer.step()
+            
+            # Apply warmup by manually adjusting learning rate
+            if global_step < warmup_steps:
+                warmup_factor = (global_step + 1) / warmup_steps
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = param_group['initial_lr'] * warmup_factor
+            
+            global_step += 1
             train_loss += loss.item()
             
             # Check for NaN
@@ -364,27 +412,37 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         history['val_loss'].append(val_loss)
         history['val_rmse'].append(val_rmse)
         
-        print(f"Epoch {epoch+1}: Train Loss = {train_loss:.6f}, "
-              f"Val Loss = {val_loss:.6f}, Val RMSE = {val_rmse:.6f}")
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        history['lr'].append(current_lr)
         
-        # Learning rate scheduling
-        if scheduler is not None:
+        # Compact output: Epoch | Train Loss | Val Loss | Val RMSE | Status
+        output_str = f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}, RMSE={val_rmse:.6f}"
+        
+        # Learning rate scheduling (only after warmup)
+        if scheduler is not None and epoch >= warmup_epochs:
             scheduler.step()
-            print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+            current_lr = scheduler.get_last_lr()[0]
+            output_str += f", LR={current_lr:.6f}"
+        elif epoch < warmup_epochs:
+            # During warmup, show current LR
+            output_str += f", LR={current_lr:.6f}(warmup)"
         
         # Save best model
         if not np.isnan(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), best_model_path)
-            print(f"  → Best model saved (val_loss: {val_loss:.6f})")
+            output_str += " ✓ Best"
         else:
             patience_counter += 1
-            print(f"  → No improvement ({patience_counter}/{patience})")
-            
-            if patience_counter >= patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                break
+            output_str += f" ({patience_counter}/{patience})"
+        
+        print(output_str)
+        
+        if patience_counter >= patience:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            break
     
     # Load best model if it exists
     if best_model_path.exists():
@@ -393,6 +451,18 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     else:
         print(f"\n⚠️ Training failed - no valid model saved!")
         print(f"Try: 1) Lower learning rate, 2) Set spatial_learnable=false, 3) Increase grad_clip")
+    
+    # Save training history
+    import pandas as pd
+    history_df = pd.DataFrame({
+        'epoch': list(range(1, len(history['train_loss']) + 1)),
+        'train_loss': history['train_loss'],
+        'val_loss': history['val_loss'],
+        'val_rmse': history['val_rmse'],
+        'lr': history['lr']
+    })
+    history_df.to_csv(output_dir / 'training_history.csv', index=False)
+    print(f"Training history saved to: {output_dir / 'training_history.csv'}")
     
     return model, history
 
@@ -476,6 +546,18 @@ def plot_training_curves(history, save_path):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
+    # Set y-axis limits based on epochs 2+ (ignore epoch 1)
+    if len(history['train_loss']) > 1:
+        train_loss_from_2 = history['train_loss'][1:]  # Skip first epoch
+        val_loss_from_2 = history['val_loss'][1:]
+        
+        y_min = min(min(train_loss_from_2), min(val_loss_from_2))
+        y_max = max(max(train_loss_from_2), max(val_loss_from_2))
+        
+        # Add 10% margin
+        margin = (y_max - y_min) * 0.1
+        ax.set_ylim(y_min - margin, y_max + margin)
+    
     # RMSE
     ax = axes[1]
     ax.plot(epochs, history['val_rmse'], 'g-', linewidth=2)
@@ -483,6 +565,17 @@ def plot_training_curves(history, save_path):
     ax.set_ylabel('RMSE')
     ax.set_title('Validation RMSE')
     ax.grid(True, alpha=0.3)
+    
+    # Set y-axis limits based on epochs 2+ (ignore epoch 1)
+    if len(history['val_rmse']) > 1:
+        rmse_from_2 = history['val_rmse'][1:]  # Skip first epoch
+        
+        y_min = min(rmse_from_2)
+        y_max = max(rmse_from_2)
+        
+        # Add 10% margin
+        margin = (y_max - y_min) * 0.1
+        ax.set_ylim(y_min - margin, y_max + margin)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -542,7 +635,7 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
     xi_grid, yi_grid = np.meshgrid(xi, yi)
     
     # Create plots
-    fig, axes = plt.subplots(n_times, 3, figsize=(15, 5 * n_times))
+    fig, axes = plt.subplots(n_times, 3, figsize=(20, 5 * n_times))
     if n_times == 1:
         axes = axes.reshape(1, -1)
     
@@ -619,7 +712,8 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
 
 
 
-def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir):
+def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir, 
+                     return_predictions=False, valid_mask=None, test_mask=None):
     """
     Plot spatial MSE heatmap averaged over all time points
     
@@ -630,6 +724,13 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir):
         train_mask: (T, S) training mask
         device: torch device
         output_dir: output directory
+        return_predictions: if True, return true and pred values
+        valid_mask: (T, S) validation mask (optional, for saving)
+        test_mask: (T, S) test mask (optional, for saving)
+    
+    Returns:
+        If return_predictions=True: (all_predictions, z_full, coords, train_mask, valid_mask, test_mask)
+        Otherwise: None
     """
     matplotlib.use('Agg')
     
@@ -701,6 +802,10 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Spatial MSE plot saved to {save_path}")
+    
+    if return_predictions:
+        return all_predictions, z_full, coords, train_mask, valid_mask, test_mask
+    return None
 
 
 def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_dir):
@@ -774,7 +879,176 @@ def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_di
     print(f"Observation pattern plot saved to {save_path}")
 
 
-def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True):
+def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, config):
+    """
+    Plot spatial basis centers before and after training
+    
+    Args:
+        model_initial: model with initial basis centers
+        model_final: trained model with final basis centers
+        train_coords: (N, 2) training coordinates
+        output_dir: output directory
+        config: configuration dict
+    """
+    matplotlib.use('Agg')
+    
+    # Extract basis information
+    centers_init = model_initial.spatial_basis.centers.detach().cpu().numpy()
+    centers_final = model_final.spatial_basis.centers.detach().cpu().numpy()
+    
+    bandwidths_init = model_initial.spatial_basis.bandwidths.detach().cpu().numpy()
+    bandwidths_final = model_final.spatial_basis.bandwidths.detach().cpu().numpy()
+    
+    learnable = config.get('spatial_learnable', False)
+    init_method = config.get('spatial_init_method', 'uniform')
+    k_spatial_centers = config.get('k_spatial_centers', [25, 81, 121])
+
+    # Sample training data for visualization (max 20000 points)
+    max_train_vis = 20000
+    if len(train_coords) > max_train_vis:
+        indices = np.random.choice(len(train_coords), max_train_vis, replace=False)
+        train_coords_vis = train_coords[indices]
+    else:
+        train_coords_vis = train_coords
+    
+    # Create figure
+    if learnable:
+        fig, axes = plt.subplots(1, 3, figsize=(24, 7))
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        axes = [axes[0], axes[1], None]
+    
+    # Normalize bandwidth for marker size
+    def bw_to_size(bw):
+        bw_norm = (bw - bw.min()) / (bw.max() - bw.min() + 1e-8)
+        return 20 + bw_norm * 180  # Range [20, 200]
+    
+    sizes_init = bw_to_size(bandwidths_init)
+    sizes_final = bw_to_size(bandwidths_final)
+    
+    # Color by resolution
+    colors = []
+    offset = 0
+    color_map = ['red', 'blue', 'green']
+    for i, k in enumerate(k_spatial_centers):
+        colors.extend([color_map[i % 3]] * k)
+        offset += k
+    
+    # Plot 1: Initial basis
+    ax = axes[0]
+    ax.scatter(train_coords_vis[:, 0], train_coords_vis[:, 1], 
+              c='lightgray', s=2, alpha=0.3, label='Train data', rasterized=True)
+    
+    # Draw domain boundary
+    from matplotlib.patches import Rectangle
+    rect = Rectangle((0, 0), 1, 1, linewidth=2, edgecolor='black', facecolor='none', linestyle='--', label='Domain [0,1]²')
+    ax.add_patch(rect)
+    
+    for i, (center, size, color) in enumerate(zip(centers_init, sizes_init, colors)):
+        ax.scatter(center[0], center[1], c=color, s=size, marker='o', 
+                  alpha=0.6, edgecolors='black', linewidths=0.5)
+    
+    # Legend for resolutions
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=color_map[i], label=f'Resolution {i+1} (k={k})') 
+                      for i, k in enumerate(k_spatial_centers)]
+    legend_elements.insert(0, Patch(facecolor='lightgray', label='Train data'))
+    
+    ax.set_title(f'Initial Basis Centers\n({init_method} initialization)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('x', fontsize=12)
+    ax.set_ylabel('y', fontsize=12)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_aspect('equal')
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.2)
+    
+    # Plot 2: Final basis (after training)
+    ax = axes[1]
+    ax.scatter(train_coords_vis[:, 0], train_coords_vis[:, 1], 
+              c='lightgray', s=2, alpha=0.3, label='Train data', rasterized=True)
+    
+    # Draw domain boundary
+    rect = Rectangle((0, 0), 1, 1, linewidth=2, edgecolor='black', facecolor='none', linestyle='--')
+    ax.add_patch(rect)
+    
+    # Count out-of-domain centers
+    out_of_domain = ((centers_final < 0) | (centers_final > 1)).any(axis=1).sum()
+    
+    for i, (center, size, color) in enumerate(zip(centers_final, sizes_final, colors)):
+        ax.scatter(center[0], center[1], c=color, s=size, marker='o', 
+                  alpha=0.6, edgecolors='black', linewidths=0.5)
+    
+    title_suffix = ' (LEARNED)' if learnable else ' (FIXED - same as initial)'
+    if learnable and out_of_domain > 0:
+        title_suffix += f'\n⚠️ {out_of_domain} centers out-of-domain'
+    
+    ax.set_title(f'Final Basis Centers{title_suffix}', fontsize=14, fontweight='bold')
+    ax.set_xlabel('x', fontsize=12)
+    ax.set_ylabel('y', fontsize=12)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_aspect('equal')
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.2)
+    
+    # Plot 3: Movement (only if learnable)
+    if learnable and axes[2] is not None:
+        ax = axes[2]
+        ax.scatter(train_coords_vis[:, 0], train_coords_vis[:, 1], 
+                  c='lightgray', s=2, alpha=0.3, label='Train data', rasterized=True)
+        
+        # Plot movement arrows
+        for i, (c_init, c_final, color) in enumerate(zip(centers_init, centers_final, colors)):
+            # Draw arrow from initial to final
+            dx = c_final[0] - c_init[0]
+            dy = c_final[1] - c_init[1]
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            if distance > 0.005:  # Only show significant movements
+                ax.arrow(c_init[0], c_init[1], dx, dy,
+                        head_width=0.015, head_length=0.01, 
+                        fc=color, ec='black', alpha=0.5, linewidth=0.5)
+        
+        # Plot initial (hollow) and final (filled) positions
+        ax.scatter(centers_init[:, 0], centers_init[:, 1], 
+                  c='white', s=80, marker='o', alpha=0.8, 
+                  edgecolors='black', linewidths=1.5, label='Initial')
+        ax.scatter(centers_final[:, 0], centers_final[:, 1], 
+                  c=colors, s=80, marker='o', alpha=0.8, 
+                  edgecolors='black', linewidths=1.5, label='Final')
+        
+        # Compute movement statistics
+        movements = np.linalg.norm(centers_final - centers_init, axis=1)
+        mean_movement = movements.mean()
+        max_movement = movements.max()
+        median_movement = np.median(movements)
+        
+        # Get penalty weights from config
+        movement_penalty = config.get('movement_penalty_weight', 0.0)
+        
+        title_text = f'Basis Movement\n'
+        title_text += f'Mean: {mean_movement:.4f}, Max: {max_movement:.4f}, Median: {median_movement:.4f}\n'
+        if movement_penalty > 0:
+            title_text += f'Movement Penalty: λ={movement_penalty}'
+        
+        ax.set_title(title_text, fontsize=13, fontweight='bold')
+        ax.set_xlabel('x', fontsize=12)
+        ax.set_ylabel('y', fontsize=12)
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect('equal')
+        ax.legend(loc='upper right', fontsize=9)
+        ax.grid(True, alpha=0.2)
+    
+    plt.tight_layout()
+    save_path = output_dir / 'basis_evolution.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Basis evolution plot saved to {save_path}")
+
+
+def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True, parallel_mode: bool = False):
     """
     Run a single experiment
     
@@ -784,6 +1058,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         output_dir: output directory for this experiment
         device: torch device
         verbose: whether to print detailed logs
+        parallel_mode: whether running in parallel mode (disables DataLoader workers)
     
     Returns:
         results: dictionary containing all results
@@ -831,7 +1106,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         obs_method=obs_method,
         obs_ratio=obs_ratio,
         obs_prob_fn=obs_prob_fn,
-        seed=config.get('seed', 42)
+        seed=experiment_seed  # Use experiment-specific seed
     )
     
     n_obs_total = obs_mask.sum()
@@ -850,7 +1125,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         obs_mask, obs_sites,
         split_method=split_method,
         train_ratio=train_ratio,
-        seed=config.get('seed', 42) + 1
+        seed=experiment_seed + 10000  # Different seed for split
     )
     
     print(f"Split method: {split_method}")
@@ -877,11 +1152,26 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     # Create dataloaders
     from torch.utils.data import DataLoader
     
+    # In parallel mode with many jobs, disable DataLoader workers to avoid nested multiprocessing
+    # If n_jobs is small (e.g., <= 16), we can safely use DataLoader workers
+    if parallel_mode:
+        # Check if we can use DataLoader workers
+        num_workers_config = config.get('num_workers', 0)
+        n_jobs = config.get('n_jobs', -1)
+        
+        # If n_jobs is set and small enough, allow DataLoader workers
+        if n_jobs > 0 and n_jobs <= 16:
+            num_workers = num_workers_config
+        else:
+            num_workers = 0
+    else:
+        num_workers = config.get('num_workers', 0)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.get('batch_size', 256),
         shuffle=True,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=collate_fn
     )
     
@@ -889,7 +1179,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         val_dataset,
         batch_size=config.get('batch_size', 256),
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=collate_fn
     )
     
@@ -897,7 +1187,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         test_dataset,
         batch_size=config.get('batch_size', 256),
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=collate_fn
     )
     
@@ -916,6 +1206,11 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     
     model = create_model(config, train_coords=train_coords)
     model = model.to(device)
+    
+    # Save initial model for visualization (deep copy of basis parameters)
+    import copy
+    model_initial = copy.deepcopy(model)
+    model_initial.eval()
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Spatial basis initialization: {config.get('spatial_init_method', 'uniform')}")
@@ -964,10 +1259,13 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     total_time = time.time() - start_time
     
     # Save results
+    config_with_dir = config.copy()
+    config_with_dir['output_dir'] = str(output_dir)
+    
     results = {
         'experiment_id': experiment_id,
         'experiment_seed': experiment_seed,
-        'config': config,
+        'config': config_with_dir,
         'metrics': {
             'train': train_metrics,
             'valid': val_metrics,
@@ -1000,7 +1298,65 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     print("Generating Prediction Visualizations")
     print("="*50)
     plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_times=3)
-    plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir)
+    pred_data = plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir, 
+                                 return_predictions=True, valid_mask=valid_mask, test_mask=test_mask)
+    
+    # Save predictions for later aggregation
+    if pred_data is not None:
+        all_predictions, z_full_data, coords_data, train_mask_data, valid_mask_data, test_mask_data = pred_data
+        np.savez(
+            output_dir / 'predictions.npz',
+            predictions=all_predictions,
+            true=z_full_data,
+            coords=coords_data,
+            train_mask=train_mask_data,
+            valid_mask=valid_mask_data,
+            test_mask=test_mask_data
+        )
+        print(f"Predictions saved to: {output_dir / 'predictions.npz'}")
+    
+    # Save basis information (initial vs final)
+    print("\n" + "="*50)
+    print("Saving Basis Information")
+    print("="*50)
+    
+    basis_info = {
+        'spatial_centers_init': model_initial.spatial_basis.centers.detach().cpu().numpy(),
+        'spatial_centers_final': model.spatial_basis.centers.detach().cpu().numpy(),
+        'spatial_bandwidths_init': model_initial.spatial_basis.bandwidths.detach().cpu().numpy(),
+        'spatial_bandwidths_final': model.spatial_basis.bandwidths.detach().cpu().numpy(),
+        'temporal_centers_init': model_initial.temporal_basis.centers.detach().cpu().numpy(),
+        'temporal_centers_final': model.temporal_basis.centers.detach().cpu().numpy(),
+        'temporal_bandwidths_init': model_initial.temporal_basis.bandwidths.detach().cpu().numpy(),
+        'temporal_bandwidths_final': model.temporal_basis.bandwidths.detach().cpu().numpy()
+    }
+    
+    np.savez(output_dir / 'basis_info.npz', **basis_info)
+    print(f"Basis info saved to: {output_dir / 'basis_info.npz'}")
+    
+    # Print summary if learnable
+    if config.get('spatial_learnable', False):
+        spatial_movement = np.linalg.norm(
+            basis_info['spatial_centers_final'] - basis_info['spatial_centers_init'], 
+            axis=1
+        )
+        print(f"Spatial centers movement: mean={spatial_movement.mean():.4f}, "
+              f"max={spatial_movement.max():.4f}, min={spatial_movement.min():.4f}")
+    
+    # Plot basis evolution
+    print("\n" + "="*50)
+    print("Generating Basis Evolution Visualization")
+    print("="*50)
+    
+    # Get training coordinates for visualization
+    if train_coords is None:
+        # Extract from training dataset if not already available
+        train_coords_list = []
+        for sample in train_dataset:
+            train_coords_list.append(sample['coords'].numpy())
+        train_coords = np.array(train_coords_list)
+    
+    plot_basis_evolution(model_initial, model, train_coords, output_dir, config)
     
     print("\n" + "="*70)
     print(f"EXPERIMENT {experiment_id} COMPLETE!")
@@ -1009,6 +1365,156 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     print("="*70)
     
     return results
+
+
+def create_averaged_spatial_mse(all_results, summary_dir):
+    """
+    Create averaged spatial MSE map from all experiments
+    
+    Args:
+        all_results: list of result dictionaries from each experiment
+        summary_dir: directory to save the averaged map
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    from scipy.interpolate import griddata
+    
+    # Load predictions from all experiments and compute MSE per experiment
+    all_site_mse_list = []
+    all_train_masks = []
+    z_full = None
+    coords = None
+    
+    for result in all_results:
+        # Find predictions.npz file
+        exp_dir = Path(result['config']['output_dir']) if 'output_dir' in result['config'] else None
+        if exp_dir is None:
+            continue
+            
+        pred_file = exp_dir / 'predictions.npz'
+        if pred_file.exists():
+            data = np.load(pred_file)
+            predictions = data['predictions']  # (T, S)
+            true_values = data['true']  # (T, S)
+            train_mask = data['train_mask']  # (T, S)
+            
+            # Compute MSE per site for this experiment (averaged over time)
+            squared_errors = (predictions - true_values) ** 2
+            site_mse = np.nanmean(squared_errors, axis=0)  # (S,)
+            all_site_mse_list.append(site_mse)
+            all_train_masks.append(train_mask)
+            
+            # Use first experiment's metadata
+            if z_full is None:
+                z_full = true_values
+                coords = data['coords']
+    
+    if len(all_site_mse_list) == 0:
+        print("No prediction files found. Skipping averaged spatial MSE map.")
+        return
+    
+    # Average MSE across experiments
+    all_site_mse_array = np.array(all_site_mse_list)  # (n_exp, S)
+    avg_site_mse = np.nanmean(all_site_mse_array, axis=0)  # (S,)
+    
+    # Get all train sites (any time)
+    train_sites_any = np.where(train_mask.any(axis=0))[0]
+    train_coords_any = coords[train_sites_any]
+    
+    # Valid sites (not all NaN)
+    valid_sites = ~np.isnan(avg_site_mse)
+    coords_valid = coords[valid_sites]
+    site_mse_valid = avg_site_mse[valid_sites]
+    
+    # Create grid for interpolation
+    grid_resolution = 200
+    xi = np.linspace(0, 1, grid_resolution)
+    yi = np.linspace(0, 1, grid_resolution)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+    
+    # Interpolate MSE to grid using nearest neighbor
+    mse_grid = griddata(coords_valid, site_mse_valid, (xi_grid, yi_grid), method='nearest')
+    
+    # Plot MSE map (without observation sites)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    im = ax.pcolormesh(xi_grid, yi_grid, mse_grid, cmap='YlOrRd', shading='auto')
+    
+    ax.set_title(f'Averaged Spatial MSE (n={len(all_site_mse_list)} experiments)')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.colorbar(im, ax=ax, label='MSE')
+    
+    plt.tight_layout()
+    save_path = summary_dir / 'spatial_mse_all.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Averaged spatial MSE plot saved to {save_path}")
+    
+    # Create observation density map
+    create_observation_density_map(all_train_masks, coords, summary_dir)
+
+
+def create_observation_density_map(all_train_masks, coords, summary_dir):
+    """
+    Create observation density heatmap to compare with spatial MSE
+    
+    Args:
+        all_train_masks: list of (T, S) training masks from all experiments
+        coords: (S, 2) coordinates
+        summary_dir: directory to save the map
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    from scipy.interpolate import griddata
+    
+    n_experiments = len(all_train_masks)
+    
+    if n_experiments == 0:
+        print("No train masks found. Skipping observation density map.")
+        return
+    
+    # Stack all train masks: (n_exp, T, S)
+    all_masks_array = np.array(all_train_masks)
+    
+    # Get total number of timepoints across all experiments
+    T, S = all_masks_array.shape[1], all_masks_array.shape[2]
+    total_possible_obs = n_experiments * T  # Max possible observations per site
+    
+    # Count total observations per site across all experiments and time
+    total_obs_per_site = all_masks_array.sum(axis=(0, 1))  # (S,)
+    
+    # Compute observation ratio per site (0 to 1)
+    obs_ratio_per_site = total_obs_per_site / total_possible_obs
+    
+    # Create grid for interpolation (same as spatial_mse_all.png)
+    grid_resolution = 200
+    xi = np.linspace(0, 1, grid_resolution)
+    yi = np.linspace(0, 1, grid_resolution)
+    xi_grid, yi_grid = np.meshgrid(xi, yi)
+    
+    # Interpolate observation ratio to grid using nearest neighbor
+    obs_ratio_grid = griddata(coords, obs_ratio_per_site, (xi_grid, yi_grid), method='nearest')
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    im = ax.pcolormesh(xi_grid, yi_grid, obs_ratio_grid, cmap='Blues', shading='auto', vmin=0, vmax=1)
+    
+    ax.set_title(f'Observation Ratio per Site (n={n_experiments} experiments)')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.colorbar(im, ax=ax, label='Observation Ratio')
+    
+    plt.tight_layout()
+    save_path = summary_dir / 'observation_density.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Observation density map saved to {save_path}")
 
 
 def aggregate_results(all_results: list, summary_dir: Path):
@@ -1075,6 +1581,12 @@ def aggregate_results(all_results: list, summary_dir: Path):
     
     print(f"\nSummary saved to: {summary_file}")
     
+    # Generate averaged spatial MSE map
+    print("\n" + "="*70)
+    print("GENERATING AVERAGED SPATIAL MSE MAP")
+    print("="*70)
+    create_averaged_spatial_mse(all_results, summary_dir)
+    
     # Print summary table
     print("\n" + "="*70)
     print("SUMMARY STATISTICS (across {} experiments)".format(n_experiments))
@@ -1111,6 +1623,99 @@ def aggregate_results(all_results: list, summary_dir: Path):
     return summary
 
 
+def run_multiple_experiments(config, output_dir, device, parallel=False):
+    """
+    Run multiple experiments for a given configuration
+    
+    Args:
+        config: configuration dictionary
+        output_dir: output directory
+        device: torch device
+        parallel: whether to run in parallel mode
+    
+    Returns:
+        summary: aggregated summary statistics
+    """
+    n_experiments = config.get('n_experiments', 10)
+    n_jobs = config.get('n_jobs', 10) if parallel else 1
+    
+    experiments_dir = Path(output_dir) / 'experiments'
+    experiments_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_results = []
+    
+    if parallel and n_experiments > 1:
+        # Parallel execution
+        from joblib import Parallel, delayed
+        import warnings
+        import matplotlib
+        matplotlib.use('Agg')
+        
+        def run_experiment_wrapper(exp_id):
+            """Wrapper for parallel execution"""
+            import os
+            import sys
+            
+            exp_output_dir = experiments_dir / str(exp_id)
+            exp_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Suppress output
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            devnull = open(os.devnull, 'w')
+            sys.stdout = devnull
+            sys.stderr = devnull
+            warnings.filterwarnings('ignore')
+            
+            try:
+                result = run_single_experiment(
+                    config, exp_id, exp_output_dir, device, 
+                    verbose=False, parallel_mode=True
+                )
+                return result
+            except Exception as e:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                devnull.close()
+                print(f"Experiment {exp_id} FAILED: {e}")
+                return None
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                devnull.close()
+        
+        results_list = Parallel(n_jobs=n_jobs, verbose=0)(
+            delayed(run_experiment_wrapper)(i) 
+            for i in range(1, n_experiments + 1)
+        )
+        all_results = [r for r in results_list if r is not None]
+        
+    else:
+        # Sequential execution
+        for i in range(1, n_experiments + 1):
+            exp_output_dir = experiments_dir / str(i)
+            exp_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                result = run_single_experiment(
+                    config, i, exp_output_dir, device, 
+                    verbose=False, parallel_mode=False
+                )
+                all_results.append(result)
+            except Exception as e:
+                print(f"Experiment {i} FAILED: {e}")
+                continue
+    
+    # Aggregate results
+    if len(all_results) > 0:
+        summary_dir = Path(output_dir) / 'summary'
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary = aggregate_results(all_results, summary_dir)
+        return summary
+    else:
+        return None
+
+
 def main():
     """Main function to run multiple experiments"""
     parser = argparse.ArgumentParser()
@@ -1139,12 +1744,18 @@ def main():
     parallel = args.parallel or config.get('parallel', False)
     n_jobs = args.n_jobs if args.n_jobs != -1 else config.get('n_jobs', -1)
     
-    # Create base output directory with date/time
+    # Get experiment tag
+    tag = config.get('tag', 'default')
+    
+    # Create base output directory with date/time/tag
     now = datetime.now()
     date_str = now.strftime('%Y%m%d')
     time_str = now.strftime('%H%M%S')
-    base_output_dir = Path('results') / date_str / time_str
-    base_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Path: results/<date>/<time>_<tag>/
+    base_output_dir = Path('results') / date_str / f"{time_str}_{tag}"
+    experiments_dir = base_output_dir / 'experiments'
+    experiments_dir.mkdir(parents=True, exist_ok=True)
     
     # Save config to base directory
     with open(base_output_dir / 'config.yaml', 'w') as f:
@@ -1153,6 +1764,7 @@ def main():
     print("\n" + "="*70)
     print("MULTIPLE EXPERIMENT RUNNER")
     print("="*70)
+    print(f"Experiment tag: {tag}")
     print(f"Number of experiments: {n_experiments}")
     print(f"Base output directory: {base_output_dir}")
     print(f"Base seed: {config.get('base_seed', 42)}")
@@ -1165,7 +1777,7 @@ def main():
     print("="*70)
     
     # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
     # Run experiments
@@ -1175,16 +1787,19 @@ def main():
         # Parallel execution using joblib
         from joblib import Parallel, delayed
         import warnings
-        import sys
-        import io
+        
+        # Set matplotlib backend globally before parallel execution
+        matplotlib.use('Agg')
         
         def run_experiment_wrapper(exp_id):
             """Wrapper for parallel execution with suppressed output"""
-            exp_output_dir = base_output_dir / str(exp_id)
+            import os
+            import sys
+            
+            exp_output_dir = experiments_dir / str(exp_id)
             exp_output_dir.mkdir(parents=True, exist_ok=True)
             
             # Suppress all output during parallel execution
-            import os
             old_stdout = sys.stdout
             old_stderr = sys.stderr
             
@@ -1193,14 +1808,11 @@ def main():
             sys.stdout = devnull
             sys.stderr = devnull
             
-            # Suppress matplotlib
-            matplotlib.use('Agg')
-            
             # Suppress warnings
             warnings.filterwarnings('ignore')
             
             try:
-                result = run_single_experiment(config, exp_id, exp_output_dir, device, verbose=False)
+                result = run_single_experiment(config, exp_id, exp_output_dir, device, verbose=False, parallel_mode=True)
                 return result
             except Exception as e:
                 # Restore output to show errors
@@ -1208,6 +1820,8 @@ def main():
                 sys.stderr = old_stderr
                 devnull.close()
                 print(f"\n❌ Experiment {exp_id} FAILED: {str(e)[:100]}")
+                import traceback
+                traceback.print_exc()
                 return None
             finally:
                 # Restore output
@@ -1234,12 +1848,12 @@ def main():
         
         for i in range(1, n_experiments + 1):
             # Create experiment-specific output directory
-            exp_output_dir = base_output_dir / str(i)
+            exp_output_dir = experiments_dir / str(i)
             exp_output_dir.mkdir(parents=True, exist_ok=True)
             
             # Run experiment with full logging
             try:
-                results = run_single_experiment(config, i, exp_output_dir, device, verbose=True)
+                results = run_single_experiment(config, i, exp_output_dir, device, verbose=True, parallel_mode=False)
                 all_results.append(results)
             except Exception as e:
                 print(f"\n❌ Experiment {i} FAILED with error: {e}")

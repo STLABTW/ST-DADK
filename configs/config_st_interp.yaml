@@ -1,21 +1,26 @@
 # Spatio-Temporal Interpolation Model Configuration
 
+# Experiment tag (used in output directory name)
+tag: integrated
+
 # Data paths
-data_file: data/2b/2b_9.csv  # Full data file
+data_file: data/2a/2a_8.csv  # Full data file
 
 # Model architecture
 k_spatial_centers: [25, 81, 121]  # Spatial basis centers (for uniform: must be perfect squares; for gmm: n_components)
 k_temporal_centers: [10, 15, 45]  # Temporal basis centers (Gaussian RBF)
-spatial_init_method: uniform      # Spatial basis initialization: 'uniform' (grid) or 'gmm' (data-adaptive)
+spatial_init_method: gmm         # Spatial basis initialization: 'uniform' (grid) or 'gmm' (data-adaptive)
+spatial_learnable: true           # Whether spatial basis centers are learnable
+domain_penalty_weight: 0.01       # Penalty weight for centers outside [0,1]^2 (0=no penalty, 0.01-1.0 recommended)
+movement_penalty_weight: 0.0      # Penalty weight for centers moving from initial positions (0=no penalty, 0.0001-0.01 recommended)
 hidden_dims: [256, 256, 128]      # MLP hidden layer dimensions
 dropout: 0.1                      # Dropout rate
 layernorm: true                   # Use LayerNorm
-spatial_learnable: false          # Whether spatial basis centers are learnable
 p_covariates: 0                   # Number of covariates
 
 # Data settings
 obs_method: site-wise             # Observation method: 'site-wise' or 'random'
-obs_ratio: 0.2                    # Observation ratio
+obs_ratio: 0.1                    # Observation ratio
 obs_spatial_pattern: corner       # Spatial observation pattern: 'uniform' or 'corner'
 obs_spatial_intensity: 10.0        # Intensity of spatial pattern (for 'corner': higher = stronger near (0,0))
 split_method: random              # Train/valid split method: 'site-wise' or 'random'
@@ -23,19 +28,21 @@ train_ratio: 0.8                  # Train/valid split ratio
 normalize_target: false           # Normalize target values
 
 # Training settings
-epochs: 50
-lr: 3e-5
-weight_decay: 1e-4
-batch_size: 1024
-patience: 5
+epochs: 300
+lr: 1e-2
+weight_decay: 5e-4
+batch_size: 512
+patience: 30
 grad_clip: 5.0
 scheduler: cosine
+warmup_epochs: 5                  # Number of warmup epochs (linear LR increase from 0 to lr)
+num_workers: 0                    # DataLoader workers per experiment (0=single process, 2-4=recommended for CPU)
 
 # Experiment settings
-n_experiments: 6                  # Number of repeated experiments (M)
+n_experiments: 30                 # Number of repeated experiments (M)
 base_seed: 42                     # Base seed (each experiment uses base_seed + i)
-parallel: true                     # Run experiments in parallel
-n_jobs: -1                        # Number of parallel jobs (-1 = all CPUs, 1 = sequential)
+parallel: true                    # Run experiments in parallel
+n_jobs: 30                        # Number of parallel jobs
 
 # Device
 device: cpu
