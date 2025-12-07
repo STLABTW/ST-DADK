@@ -1210,15 +1210,18 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     # Create model
     print("\nCreating model...")
     
-    # Prepare training coordinates for GMM initialization if needed
+    # Prepare training coordinates for data-adaptive initialization if needed
     train_coords = None
-    if config.get('spatial_init_method', 'uniform') == 'gmm':
-        # Extract unique coordinates from training data
+    init_method = config.get('spatial_init_method', 'uniform')
+    if init_method in ['gmm', 'random_site', 'kmeans_balanced']:
+        # Extract spatial coordinates from training data (with temporal duplicates)
+        # Note: Keep all (s,t) pairs to reflect spatio-temporal data density
+        # Sites with more temporal observations will have higher weight in clustering
         train_coords_list = []
         for sample in train_dataset:
             train_coords_list.append(sample['coords'].numpy())
         train_coords = np.array(train_coords_list)  # (N_train, 2)
-        print(f"Using GMM initialization with {len(train_coords)} training coordinates")
+        print(f"Using {init_method} initialization with {len(train_coords)} training samples")
     
     model = create_model(config, train_coords=train_coords)
     model = model.to(device)

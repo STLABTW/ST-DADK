@@ -65,8 +65,21 @@ def generate_config_combinations(base_config, param_grid, filter_fn=None):
         tag_parts = [f"config{config_counter:03d}"]
         for param_name, param_value in zip(param_names, combo):
             # Shorten parameter values for tag
-            if param_name == 'spatial_init_method':
-                tag_parts.append('uni' if param_value == 'uniform' else 'gmm')
+            if param_name == 'spatial_basis_function':
+                abbrev_map = {
+                    'wendland': 'wend',
+                    'gaussian': 'gaus',
+                    'triangular': 'tria'
+                }
+                tag_parts.append(abbrev_map.get(param_value, param_value))
+            elif param_name == 'spatial_init_method':
+                abbrev_map = {
+                    'uniform': 'uni',
+                    'gmm': 'gmm',
+                    'random_site': 'rnd',
+                    'kmeans_balanced': 'kmb'
+                }
+                tag_parts.append(abbrev_map.get(param_value, param_value))
             elif param_name == 'spatial_learnable':
                 tag_parts.append('lrn' if param_value else 'fix')
             elif param_name == 'obs_method':
@@ -103,13 +116,18 @@ def save_experiment_results(all_results, output_dir):
     for result in all_results:
         if result is None:
             continue
-            
+        
+        # Skip failed experiments
         summary = result['summary']
+        if summary is None:
+            continue
+            
         config = result['config']
         
         record = {
             'config_id': config['config_id'],
             'tag': config['tag'],
+            'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),
             'spatial_init_method': config['spatial_init_method'],
             'spatial_learnable': config['spatial_learnable'],
             'obs_method': config['obs_method'],
@@ -145,8 +163,12 @@ def save_experiment_results(all_results, output_dir):
     for result in all_results:
         if result is None:
             continue
-            
+        
+        # Skip failed experiments
         summary = result['summary']
+        if summary is None:
+            continue
+            
         config = result['config']
         
         # Extract individual experiment values
@@ -170,6 +192,7 @@ def save_experiment_results(all_results, output_dir):
                             'config_id': config['config_id'],
                             'tag': config['tag'],
                             'experiment_id': exp_id,
+                            'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),
                             'spatial_init_method': config['spatial_init_method'],
                             'spatial_learnable': config['spatial_learnable'],
                             'obs_method': config['obs_method'],
@@ -233,11 +256,12 @@ def main():
     # Define parameter grid
     param_grid = {
         'data_file': ['data/2b/2b_8.csv'],
-        'spatial_init_method': ['uniform', 'gmm'],
+        'spatial_basis_function': ['wendland'],  # NEW: Phase 1
+        'spatial_init_method': ['uniform', 'gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
         'spatial_learnable': [True, False],
-        'obs_method': ['site-wise', 'random'],
+        'obs_method': ['random'],
         'obs_ratio': [0.05],
-        'obs_spatial_pattern': ['corner', 'uniform'],
+        'obs_spatial_pattern': ['corner'],
     }
     
     # Define filter function for conditional combinations
@@ -247,7 +271,7 @@ def main():
         # If you want only: uniform+fixed and gmm+learnable
         if params['spatial_init_method'] == 'uniform' and params['spatial_learnable'] == True:
             return False
-        if params['spatial_init_method'] == 'gmm' and params['spatial_learnable'] == False:
+        if params['spatial_init_method'] in ['gmm', 'random_site', 'kmeans_balanced'] and params['spatial_learnable'] == False:
             return False
         return True
     
@@ -415,6 +439,38 @@ def main():
     print(f"  - grid_search_summary.csv: Summary statistics per config")
     print(f"  - grid_search_detail.csv: Detailed results per iteration")
     print(f"  - grid_search_configs.csv: Configuration details")
+    print("="*100)
+    
+    # Auto-run analysis if there are successful experiments
+    if n_success > 0:
+        print("\n" + "="*100)
+        print("RUNNING ANALYSIS")
+        print("="*100)
+        
+        try:
+            import subprocess
+            analysis_script = Path(__file__).parent / 'analyze_grid_search.py'
+            
+            print(f"\nRunning: python {analysis_script} {output_dir}")
+            
+            result = subprocess.run(
+                [sys.executable, str(analysis_script), str(output_dir)],
+                capture_output=False,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                print("\n✓ Analysis completed successfully!")
+            else:
+                print(f"\n✗ Analysis failed with return code: {result.returncode}")
+                
+        except Exception as e:
+            print(f"\n✗ Analysis failed: {e}")
+            print("You can run analysis manually with:")
+            print(f"  python scripts/analyze_grid_search.py --results_dir {output_dir}")
+    
+    print("\n" + "="*100)
+    print(f"All results and plots saved to: {output_dir}")
     print("="*100)
 
 

@@ -17,33 +17,73 @@ from sklearn.mixture import GaussianMixture
 
 class SpatialBasisEmbedding(nn.Module):
     """
-    Wendland RBF with multi-resolution centers
+    Spatial basis embedding with multi-resolution centers
     
-    Two initialization methods:
+    Supports multiple basis function types:
+    - 'wendland': Wendland C^4 RBF (compact support)
+    - 'gaussian': Gaussian RBF (infinite support, rapid decay)
+    - 'triangular': Triangular/Linear basis (compact support)
+    
+    All basis functions are calibrated to have similar effective support
+    (same standard deviation) for fair comparison.
+    
+    Four initialization methods:
     1. 'uniform': Regular grid (original method)
        - n_centers: list of integers (e.g., [25, 81, 121])
        - Each integer k -> sqrt(k) x sqrt(k) regular grid in [0,1]^2
        - Bandwidth: 2.5 × grid spacing for each resolution
     
-    2. 'gmm': Gaussian Mixture Model (data-adaptive)
+    2. 'gmm': Gaussian Mixture Model (data-adaptive, density estimation)
        - Fit GMM with n_components from n_centers list
        - Use GMM means as centers
        - Use GMM std * 2.5 as bandwidths
        - Multi-resolution: smaller n_components -> larger bandwidth
+    
+    3. 'random_site': Random sampling from observation sites (density-weighted)
+       - Randomly sample k sites from training coordinates
+       - Bandwidth: 2.5 × average distance to 4 nearest neighbors
+       - Data-driven but faster than GMM
+    
+    4. 'kmeans_balanced': Balanced K-means (density-adaptive via equal coverage)
+       - Size-constrained K-means: each cluster has exactly n/k samples
+       - Enforces balanced spatial coverage (density-adaptive)
+       - Centers can be anywhere in data space
+       - Bandwidth: 2.5 × average distance to 4 nearest cluster centers
     """
     
+    # Calibration factors to match effective support across basis functions
+    # Based on standard deviation matching (Wendland as reference)
+    CALIBRATION_FACTORS = {
+        'wendland': 1.000000,
+        'gaussian': 0.223477,
+        'triangular': 0.654714,
+    }
+    
     def __init__(self, n_centers: list = [25, 81, 121], learnable: bool = False,
-                 init_method: str = 'uniform', train_coords: np.ndarray = None):
+                 init_method: str = 'uniform', train_coords: np.ndarray = None,
+                 basis_function: str = 'wendland'):
         super().__init__()
         self.n_centers = n_centers
         self.learnable = learnable
         self.init_method = init_method
+        self.basis_function = basis_function
+        
+        # Validate basis function
+        if basis_function not in self.CALIBRATION_FACTORS:
+            raise ValueError(f"Unknown basis function: {basis_function}. "
+                           f"Choose from {list(self.CALIBRATION_FACTORS.keys())}")
         
         if init_method == 'uniform':
             centers, bandwidths = self._init_uniform()
         elif init_method == 'gmm':
             assert train_coords is not None, "train_coords required for GMM initialization"
             centers, bandwidths = self._init_gmm(train_coords)
+        elif init_method == 'random_site':
+            assert train_coords is not None, "train_coords required for random_site initialization"
+            centers, bandwidths = self._init_random_site(train_coords)
+        elif init_method == 'kmeans_balanced':
+            assert train_coords is not None, "train_coords required for kmeans_balanced initialization"
+            centers, bandwidths = self._init_kmeans_balanced(train_coords)
         else:
             raise ValueError(f"Unknown init_method: {init_method}")
         
@@ -107,8 +147,12 @@ class SpatialBasisEmbedding(nn.Module):
         """
         GMM-based data-adaptive initialization
         
+        Uses training samples (with temporal duplicates) to reflect spatio-temporal density.
+        Subsamples to 50000 if data is too large for computational efficiency.
+        
         Args:
             train_coords: (N, 2) numpy array of training coordinates in [0,1]^2
+                         (includes temporal duplicates to reflect data density)
         
         Returns:
             centers: (sum(n_centers), 2) tensor
@@ -117,14 +161,15 @@ class SpatialBasisEmbedding(nn.Module):
         centers_list = []
         bandwidths_list = []
         
-        # **SPEEDUP 1: Subsample training data for faster GMM fitting**
-        max_samples_for_gmm = 50000  # Limit samples for GMM (much faster!)
+        # Subsample if too many samples (for computational efficiency)
+        max_samples_for_gmm = 10000
         if len(train_coords) > max_samples_for_gmm:
-            print(f"  Subsampling {max_samples_for_gmm}/{len(train_coords)} points for GMM initialization")
+            print(f"  GMM initialization: Subsampling {max_samples_for_gmm}/{len(train_coords)} training samples")
             indices = np.random.choice(len(train_coords), max_samples_for_gmm, replace=False)
-            train_coords_sampled = train_coords[indices]
+            train_coords_sub = train_coords[indices]
         else:
-            train_coords_sampled = train_coords
+            print(f"  GMM initialization: {len(train_coords)} training samples (with temporal duplicates)")
+            train_coords_sub = train_coords
         
         # Compute uniform bandwidth reference for each resolution (for clipping)
         uniform_bandwidths = []
@@ -135,7 +180,7 @@ class SpatialBasisEmbedding(nn.Module):
             uniform_bandwidths.append(uniform_bw)
         
         # Convert to float64 for better numerical stability
-        train_coords_64 = train_coords_sampled.astype(np.float64)
+        train_coords_64 = train_coords_sub.astype(np.float64)
         
         for i, n_components in enumerate(self.n_centers):
             # **SPEEDUP 2: Reduced iterations and initializations**
@@ -179,10 +224,175 @@ class SpatialBasisEmbedding(nn.Module):
         
         return centers, bandwidths
     
+    def _init_random_site(self, train_coords: np.ndarray):
+        """
+        Random site sampling initialization
+        
+        For each resolution k:
+        1. Randomly sample k sites from training coordinates (WITH temporal duplicates)
+        2. Compute bandwidth as 2.5 × average distance to 4 nearest neighbors
+        
+        This gives a data-driven initialization that's faster than GMM
+        and naturally adapts to spatio-temporal data density.
+        Sites with more temporal observations have higher probability of being selected.
+        
+        Args:
+            train_coords: (N, 2) numpy array of training coordinates in [0,1]^2
+                         (includes temporal duplicates to reflect data density)
+        
+        Returns:
+            centers: (sum(n_centers), 2) tensor
+            bandwidths: (sum(n_centers),) tensor
+        """
+        from scipy.spatial.distance import cdist
+        
+        centers_list = []
+        bandwidths_list = []
+        
+        # Do NOT use unique - keep temporal duplicates to reflect data density
+        print(f"  Random site initialization: {len(train_coords)} training samples (with temporal duplicates)")
+        
+        for k in self.n_centers:
+            # Random sampling from training coordinates (weighted by temporal frequency)
+            if k > len(train_coords):
+                print(f"  Warning: k={k} exceeds training samples ({len(train_coords)}), sampling with replacement")
+                indices = np.random.choice(len(train_coords), k, replace=True)
+            else:
+                indices = np.random.choice(len(train_coords), k, replace=False)
+            
+            centers = train_coords[indices]  # (k, 2)
+            
+            # Compute pairwise distances
+            distances = cdist(centers, centers)  # (k, k)
+            
+            # For each center, find distance to 4 nearest neighbors (excluding self)
+            # Set diagonal to infinity to exclude self
+            np.fill_diagonal(distances, np.inf)
+            
+            # Sort distances and take first 4 (or fewer if k < 5)
+            n_neighbors = min(4, k - 1) if k > 1 else 1
+            sorted_distances = np.sort(distances, axis=1)  # (k, k)
+            nearest_distances = sorted_distances[:, :n_neighbors]  # (k, n_neighbors)
+            
+            # Average distance to n_neighbors nearest sites for each center
+            avg_distances = nearest_distances.mean(axis=1)  # (k,)
+            
+            # Bandwidth = 2.5 × average distance to nearest neighbors
+            bandwidth_scale = 2.5
+            bandwidths = avg_distances * bandwidth_scale  # (k,)
+            
+            # Handle edge case: if all distances are inf (k=1), use default
+            if k == 1:
+                side = int(math.sqrt(self.n_centers[0]))
+                spacing = 1.0 / (side - 1) if side > 1 else 1.0
+                bandwidths = np.array([2.5 * spacing])
+            
+            centers_list.append(torch.from_numpy(centers).float())
+            bandwidths_list.append(torch.from_numpy(bandwidths).float())
+        
+        # Concatenate all resolutions
+        centers = torch.cat(centers_list, dim=0)  # (sum(n_centers), 2)
+        bandwidths = torch.cat(bandwidths_list, dim=0)  # (sum(n_centers),)
+        
+        return centers, bandwidths
+    
+    def _init_kmeans_balanced(self, train_coords: np.ndarray):
+        """
+        Balanced K-means clustering initialization
+        
+        For each resolution k:
+        1. Run size-constrained K-means: each cluster has exactly n/k samples
+        2. Use cluster centers as basis centers (can be anywhere, not limited to obs sites)
+        3. Compute bandwidth as 2.5 × average distance to 4 nearest cluster centers
+        
+        This enforces balanced spatial coverage (each center covers equal number of samples).
+        Unlike standard K-means (which minimizes variance), this ensures equal cluster sizes.
+        Subsamples to 50000 if data is too large for computational efficiency.
+        
+        Args:
+            train_coords: (N, 2) numpy array of training coordinates in [0,1]^2
+                         (includes temporal duplicates to reflect data density)
+        
+        Returns:
+            centers: (sum(n_centers), 2) tensor
+            bandwidths: (sum(n_centers),) tensor
+        """
+        from scipy.spatial.distance import cdist
+        from k_means_constrained import KMeansConstrained
+        
+        centers_list = []
+        bandwidths_list = []
+        
+        # Subsample if too many samples (for computational efficiency)
+        max_samples_for_kmeans = 10000
+        if len(train_coords) > max_samples_for_kmeans:
+            print(f"  Balanced K-means initialization: Subsampling {max_samples_for_kmeans}/{len(train_coords)} training samples")
+            indices = np.random.choice(len(train_coords), max_samples_for_kmeans, replace=False)
+            train_coords_sub = train_coords[indices]
+        else:
+            print(f"  Balanced K-means initialization: {len(train_coords)} training samples (with temporal duplicates)")
+            train_coords_sub = train_coords
+        
+        for k in self.n_centers:
+            # Size-constrained K-means: each cluster has size_min = size_max = n/k
+            n_samples = len(train_coords_sub)
+            size_per_cluster = n_samples // k
+            
+            # Handle case where n is not perfectly divisible by k
+            # Set size_min slightly smaller to allow flexibility
+            size_min = max(1, size_per_cluster - 1)
+            size_max = size_per_cluster + (n_samples % k)  # Last cluster can be slightly larger
+            
+            kmeans_balanced = KMeansConstrained(
+                n_clusters=k,
+                size_min=size_min,
+                size_max=size_max,
+                random_state=42,
+                n_init=3,  # Match GMM (was 10)
+                max_iter=100  # Match GMM (was 300)
+            )
+            kmeans_balanced.fit(train_coords_sub)
+            
+            # Extract cluster centers
+            centers = kmeans_balanced.cluster_centers_  # (k, 2)
+            
+            # Compute pairwise distances between cluster centers
+            distances = cdist(centers, centers)  # (k, k)
+            
+            # For each center, find distance to 4 nearest other centers (excluding self)
+            np.fill_diagonal(distances, np.inf)
+            
+            # Sort distances and take first 4 (or fewer if k < 5)
+            n_neighbors = min(4, k - 1) if k > 1 else 1
+            sorted_distances = np.sort(distances, axis=1)  # (k, k)
+            nearest_distances = sorted_distances[:, :n_neighbors]  # (k, n_neighbors)
+            
+            # Average distance to n_neighbors nearest centers
+            avg_distances = nearest_distances.mean(axis=1)  # (k,)
+            
+            # Bandwidth = 2.5 × average distance to nearest centers
+            bandwidth_scale = 2.5
+            bandwidths = avg_distances * bandwidth_scale  # (k,)
+            
+            # Handle edge case: if k=1, use default bandwidth
+            if k == 1:
+                side = int(math.sqrt(self.n_centers[0]))
+                spacing = 1.0 / (side - 1) if side > 1 else 1.0
+                bandwidths = np.array([2.5 * spacing])
+            
+            centers_list.append(torch.from_numpy(centers).float())
+            bandwidths_list.append(torch.from_numpy(bandwidths).float())
+        
+        # Concatenate all resolutions
+        centers = torch.cat(centers_list, dim=0)  # (sum(n_centers), 2)
+        bandwidths = torch.cat(bandwidths_list, dim=0)  # (sum(n_centers),)
+        
+        return centers, bandwidths
+    
     def forward(self, coords: torch.Tensor):
         """
         coords: (B, 2) or (N, 2) - normalized coordinates in [0,1]^2
-        Returns: (B, k) or (N, k) - Wendland basis
+        Returns: (B, k) or (N, k) - basis function values
         """
         # Compute pairwise distances
         dist = torch.cdist(coords.unsqueeze(0) if coords.dim() == 2 else coords, 
@@ -190,13 +400,54 @@ class SpatialBasisEmbedding(nn.Module):
         if coords.dim() == 2:
             dist = dist.squeeze(0)  # (N, k)
         
-        # Normalize by bandwidth
-        r = (dist / self.bandwidths).clamp(max=1.0)
+        # Normalize by bandwidth and apply calibration factor
+        # Calibration factors < 1.0 make the basis NARROWER (more local)
+        # by dividing bandwidth by a smaller value
+        calibration = self.CALIBRATION_FACTORS[self.basis_function]
+        r = dist / (self.bandwidths * calibration)
         
-        # Wendland C^4 function: (1 - r)^6 * (35*r^2 + 18*r + 3) / 3 for r in [0,1]
-        phi = torch.pow(1 - r, 6) * (35 * r**2 + 18 * r + 3) / 3
+        # Apply basis function
+        if self.basis_function == 'wendland':
+            phi = self._wendland(r)
+        elif self.basis_function == 'gaussian':
+            phi = self._gaussian(r)
+        elif self.basis_function == 'triangular':
+            phi = self._triangular(r)
+        else:
+            raise ValueError(f"Unknown basis function: {self.basis_function}")
         
         return phi
+    
+    def _wendland(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Wendland C^4 RBF
+        φ(r) = (1-r)^6_+ * (35*r^2 + 18*r + 3) / 3 for r in [0,1]
+        
+        Compact support: [0, 1]
+        C^4 continuous (4 times continuously differentiable)
+        """
+        r = r.clamp(max=1.0)
+        return torch.pow(1 - r, 6) * (35 * r**2 + 18 * r + 3) / 3
+    
+    def _gaussian(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Gaussian RBF
+        φ(r) = exp(-0.5 * r^2)
+        
+        Infinite support but rapid decay
+        C^∞ continuous (infinitely differentiable)
+        """
+        return torch.exp(-0.5 * r ** 2)
+    
+    def _triangular(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Triangular (Linear) basis
+        φ(r) = (1-r)_+ for r in [0,1]
+        
+        Compact support: [0, 1]
+        C^0 continuous (continuous but not differentiable at r=1)
+        """
+        return torch.clamp(1 - r, min=0.0)
     
     def compute_domain_penalty(self, domain_bounds=(0.0, 1.0)):
         """
@@ -323,19 +574,22 @@ class STInterpMLP(nn.Module):
                  layernorm: bool = True,
                  spatial_learnable: bool = False,
                  spatial_init_method: str = 'uniform',
+                 spatial_basis_function: str = 'wendland',
                  train_coords: np.ndarray = None):
         super().__init__()
         
         self.p = p
         self.k_spatial_centers = k_spatial_centers
         self.spatial_init_method = spatial_init_method
+        self.spatial_basis_function = spatial_basis_function
         
         # Spatial basis embedding
         self.spatial_basis = SpatialBasisEmbedding(
             n_centers=k_spatial_centers,
             learnable=spatial_learnable,
             init_method=spatial_init_method,
-            train_coords=train_coords
+            train_coords=train_coords,
+            basis_function=spatial_basis_function
         )
         
         # Temporal basis embedding
@@ -426,5 +680,6 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         layernorm=config.get('layernorm', True),
         spatial_learnable=config.get('spatial_learnable', False),
         spatial_init_method=config.get('spatial_init_method', 'uniform'),
+        spatial_basis_function=config.get('spatial_basis_function', 'wendland'),
         train_coords=train_coords
     )
