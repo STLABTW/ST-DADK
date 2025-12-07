@@ -314,11 +314,18 @@ def main():
             # Run experiments for this config
             try:
                 from train_st_interp import run_multiple_experiments
+                
+                # Check for optional experiment range arguments
+                start_exp_id = config.get('start_exp_id', None)
+                end_exp_id = config.get('end_exp_id', None)
+                
                 summary = run_multiple_experiments(
                     config, 
                     config_output_dir, 
                     device,
-                    parallel=True
+                    parallel=True,
+                    start_exp_id=start_exp_id,
+                    end_exp_id=end_exp_id
                 )
                 
                 return {
@@ -327,7 +334,7 @@ def main():
                     'status': 'success'
                 }
             except Exception as e:
-                print(f"✗ Config {config['tag']} FAILED: {e}")
+                # Don't print in parallel mode - just return error
                 return {
                     'config': config,
                     'summary': None,

@@ -8,10 +8,59 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
+import argparse
+
+def get_latest_grid_search_dir():
+    """Find the most recently created grid_search directory in results folder"""
+    results_path = Path('results')
+    if not results_path.exists():
+        return None
+    
+    # Find all directories containing 'grid_search' in their name
+    grid_dirs = []
+    for item in results_path.iterdir():
+        if item.is_dir() and 'grid_search' in item.name:
+            grid_dirs.append(item)
+    
+    if not grid_dirs:
+        return None
+    
+    # Return the most recently modified directory
+    latest_dir = max(grid_dirs, key=lambda p: p.stat().st_mtime)
+    return str(latest_dir)
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Analyze grid search results')
+parser.add_argument('grid_dir', type=str, nargs='?', 
+                    default=None,
+                    help='Grid search directory path (default: latest grid_search folder in results/)')
+args = parser.parse_args()
+
+# Determine grid directory
+if args.grid_dir is None:
+    latest_dir = get_latest_grid_search_dir()
+    if latest_dir is None:
+        print("❌ No grid_search directories found in results/")
+        print("Please specify a grid_dir explicitly:")
+        print("  python scripts/analyze_grid_search.py <grid_dir>")
+        exit(1)
+    results_dir = Path(latest_dir)
+    print(f"Using latest grid_search directory: {results_dir}")
+else:
+    results_dir = Path(args.grid_dir)
 
 # Load data
-results_dir = Path('results/20251206_222230_grid_search')
-df_detail = pd.read_csv(results_dir / 'grid_search_detail.csv')
+if not results_dir.exists():
+    print(f"❌ Grid directory not found: {results_dir}")
+    exit(1)
+
+detail_csv = results_dir / 'grid_search_detail.csv'
+if not detail_csv.exists():
+    print(f"❌ grid_search_detail.csv not found in {results_dir}")
+    exit(1)
+
+print(f"Analyzing results from: {results_dir}")
+df_detail = pd.read_csv(detail_csv)
 
 # Extract data_file from tag
 df_detail['data_file'] = df_detail['tag'].str.extract(r'(data/\w+/\w+\.csv)')

@@ -438,10 +438,16 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             patience_counter += 1
             output_str += f" ({patience_counter}/{patience})"
         
-        print(output_str)
+        try:
+            print(output_str)
+        except (ValueError, OSError):
+            pass  # stdout closed in parallel mode
         
         if patience_counter >= patience:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            try:
+                print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            except (ValueError, OSError):
+                pass
             break
     
     # Load best model if it exists
@@ -1048,7 +1054,7 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
     print(f"Basis evolution plot saved to {save_path}")
 
 
-def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True, parallel_mode: bool = False):
+def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True, parallel_mode: bool = False, skip_existing: bool = False):
     """
     Run a single experiment
     
@@ -1059,10 +1065,20 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         device: torch device
         verbose: whether to print detailed logs
         parallel_mode: whether running in parallel mode (disables DataLoader workers)
+        skip_existing: if True, skip if results.json already exists
     
     Returns:
         results: dictionary containing all results
     """
+    # Check if results already exist
+    if skip_existing:
+        result_file = output_dir / 'results.json'
+        if result_file.exists():
+            if verbose:
+                print(f"✓ Experiment {experiment_id} already completed, skipping...")
+            with open(result_file, 'r') as f:
+                return json.load(f)
+    
     start_time = time.time()
     
     if verbose:
@@ -1623,7 +1639,8 @@ def aggregate_results(all_results: list, summary_dir: Path):
     return summary
 
 
-def run_multiple_experiments(config, output_dir, device, parallel=False):
+def run_multiple_experiments(config, output_dir, device, parallel=False, 
+                            start_exp_id=None, end_exp_id=None, skip_existing=False):
     """
     Run multiple experiments for a given configuration
     
@@ -1632,12 +1649,19 @@ def run_multiple_experiments(config, output_dir, device, parallel=False):
         output_dir: output directory
         device: torch device
         parallel: whether to run in parallel mode
+        start_exp_id: Starting experiment ID (1-based). If None, starts from 1
+        end_exp_id: Ending experiment ID (inclusive). If None, uses n_experiments
+        skip_existing: if True, skip experiments that already have results.json
     
     Returns:
         summary: aggregated summary statistics
     """
     n_experiments = config.get('n_experiments', 10)
     n_jobs = config.get('n_jobs', 10) if parallel else 1
+    
+    # Determine experiment range
+    start_id = start_exp_id if start_exp_id is not None else 1
+    end_id = end_exp_id if end_exp_id is not None else n_experiments
     
     experiments_dir = Path(output_dir) / 'experiments'
     experiments_dir.mkdir(parents=True, exist_ok=True)
@@ -1670,47 +1694,61 @@ def run_multiple_experiments(config, output_dir, device, parallel=False):
             try:
                 result = run_single_experiment(
                     config, exp_id, exp_output_dir, device, 
-                    verbose=False, parallel_mode=True
+                    verbose=False, parallel_mode=True, skip_existing=skip_existing
                 )
                 return result
             except Exception as e:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
-                devnull.close()
-                print(f"Experiment {exp_id} FAILED: {e}")
+                # Write error to file instead of printing
+                error_file = exp_output_dir / 'error.txt'
+                with open(error_file, 'w') as f:
+                    f.write(f"Experiment {exp_id} FAILED\n")
+                    f.write(f"Error: {str(e)}\n\n")
+                    import traceback
+                    f.write(traceback.format_exc())
                 return None
             finally:
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
-                devnull.close()
+                if devnull and not devnull.closed:
+                    devnull.close()
         
-        results_list = Parallel(n_jobs=n_jobs, verbose=0)(
+        results_list = Parallel(n_jobs=n_jobs, verbose=10)(
             delayed(run_experiment_wrapper)(i) 
-            for i in range(1, n_experiments + 1)
+            for i in range(start_id, end_id + 1)
         )
         all_results = [r for r in results_list if r is not None]
         
     else:
         # Sequential execution
-        for i in range(1, n_experiments + 1):
+        for i in range(start_id, end_id + 1):
             exp_output_dir = experiments_dir / str(i)
             exp_output_dir.mkdir(parents=True, exist_ok=True)
             
             try:
                 result = run_single_experiment(
                     config, i, exp_output_dir, device, 
-                    verbose=False, parallel_mode=False
+                    verbose=False, parallel_mode=False, skip_existing=skip_existing
                 )
                 all_results.append(result)
             except Exception as e:
                 print(f"Experiment {i} FAILED: {e}")
                 continue
     
-    # Aggregate results
-    if len(all_results) > 0:
-        summary_dir = Path(output_dir) / 'summary'
-        summary_dir.mkdir(parents=True, exist_ok=True)
-        summary = aggregate_results(all_results, summary_dir)
+    # Aggregate results from ALL experiments (not just the ones we just ran)
+    summary_dir = Path(output_dir) / 'summary'
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load all existing experiment results
+    all_exp_results = []
+    for i in range(1, n_experiments + 1):
+        result_file = experiments_dir / str(i) / 'results.json'
+        if result_file.exists():
+            with open(result_file, 'r') as f:
+                result = json.load(f)
+                all_exp_results.append(result)
+    
+    if len(all_exp_results) > 0:
+        summary = aggregate_results(all_exp_results, summary_dir)
         return summary
     else:
         return None
@@ -1725,6 +1763,9 @@ def main():
     parser.add_argument('--base_seed', type=int, default=None)
     parser.add_argument('--parallel', action='store_true', help='Run experiments in parallel')
     parser.add_argument('--n_jobs', type=int, default=-1, help='Number of parallel jobs (-1 for all CPUs, 0 for sequential)')
+    parser.add_argument('--start_exp_id', type=int, default=None, help='Starting experiment ID (1-based)')
+    parser.add_argument('--end_exp_id', type=int, default=None, help='Ending experiment ID (inclusive)')
+    parser.add_argument('--skip-existing', action='store_true', help='Skip experiments that already have results.json')
     args = parser.parse_args()
     
     # Load config
@@ -1780,6 +1821,11 @@ def main():
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
+    # Determine experiment range
+    start_id = args.start_exp_id if args.start_exp_id is not None else 1
+    end_id = args.end_exp_id if args.end_exp_id is not None else n_experiments
+    skip_existing = args.skip_existing
+    
     # Run experiments
     all_results = []
     
@@ -1812,7 +1858,8 @@ def main():
             warnings.filterwarnings('ignore')
             
             try:
-                result = run_single_experiment(config, exp_id, exp_output_dir, device, verbose=False, parallel_mode=True)
+                result = run_single_experiment(config, exp_id, exp_output_dir, device, 
+                                              verbose=False, parallel_mode=True, skip_existing=skip_existing)
                 return result
             except Exception as e:
                 # Restore output to show errors
@@ -1829,31 +1876,32 @@ def main():
                 sys.stderr = old_stderr
                 devnull.close()
         
-        print(f"Running {n_experiments} experiments in parallel with {n_jobs} jobs...")
+        print(f"Running experiments {start_id} to {end_id} in parallel with {n_jobs} jobs...")
         print("(Detailed logs suppressed during parallel execution)\n")
         
         # Run in parallel with progress bar
         results_list = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(run_experiment_wrapper)(i) for i in range(1, n_experiments + 1)
+            delayed(run_experiment_wrapper)(i) for i in range(start_id, end_id + 1)
         )
         
         # Filter out None (failed experiments)
         all_results = [r for r in results_list if r is not None]
         
-        print(f"\n✅ Completed {len(all_results)}/{n_experiments} experiments successfully")
+        print(f"\n✅ Completed {len(all_results)}/{end_id - start_id + 1} experiments successfully")
         
     else:
         # Sequential execution with full logging
-        print(f"Running {n_experiments} experiments sequentially...\n")
+        print(f"Running experiments {start_id} to {end_id} sequentially...\n")
         
-        for i in range(1, n_experiments + 1):
+        for i in range(start_id, end_id + 1):
             # Create experiment-specific output directory
             exp_output_dir = experiments_dir / str(i)
             exp_output_dir.mkdir(parents=True, exist_ok=True)
             
             # Run experiment with full logging
             try:
-                results = run_single_experiment(config, i, exp_output_dir, device, verbose=True, parallel_mode=False)
+                results = run_single_experiment(config, i, exp_output_dir, device, 
+                                              verbose=True, parallel_mode=False, skip_existing=skip_existing)
                 all_results.append(results)
             except Exception as e:
                 print(f"\n❌ Experiment {i} FAILED with error: {e}")
@@ -1861,11 +1909,25 @@ def main():
                 traceback.print_exc()
                 continue
     
-    # Aggregate results if multiple experiments
-    if n_experiments > 1 and len(all_results) > 0:
+    # Aggregate results from ALL experiments (not just the ones we just ran)
+    if n_experiments > 1:
         summary_dir = base_output_dir / 'summary'
         summary_dir.mkdir(parents=True, exist_ok=True)
-        aggregate_results(all_results, summary_dir)
+        
+        # Load all existing experiment results
+        all_exp_results = []
+        for i in range(1, n_experiments + 1):
+            result_file = experiments_dir / str(i) / 'results.json'
+            if result_file.exists():
+                with open(result_file, 'r') as f:
+                    import json
+                    result = json.load(f)
+                    all_exp_results.append(result)
+        
+        if len(all_exp_results) > 0:
+            return aggregate_results(all_exp_results, summary_dir)
+    
+    return None
     
     print("\n" + "="*70)
     print("ALL EXPERIMENTS COMPLETE!")
