@@ -31,7 +31,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from stnf.models.st_interp import STInterpMLP, create_model
 from stnf.dataio.kaust_loader import load_kaust_csv_single
-from stnf.utils import set_seed, compute_metrics
+from stnf.utils import set_seed, compute_metrics, ModelEMA
 
 
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
@@ -249,22 +249,40 @@ def collate_fn(batch):
 def train_model(model, train_loader, val_loader, config, device, output_dir):
     """Train the spatio-temporal interpolation model"""
     
+    # Progressive unfreezing settings
+    basis_unfreeze_epoch = config.get('basis_unfreeze_epoch', 0)  # 0 = train from start
+    basis_lr_rampup_epochs = config.get('basis_lr_rampup_epochs', 0)  # epochs to gradually increase basis lr
+    
     if config.get('spatial_learnable', False):
         # Learnable basis: use differential learning rates
         basis_params = list(model.spatial_basis.parameters())
         mlp_params = [p for p in model.parameters() if not any(p is bp for bp in basis_params)]
         
         lr = float(config.get('lr', 1e-3))
+        basis_lr_ratio = config.get('basis_lr_ratio', 0.05)  # Default: 5% of MLP lr
+        
+        # If unfreezing later, start with lr=0 for basis
+        initial_basis_lr = 0.0 if basis_unfreeze_epoch > 0 else lr * basis_lr_ratio
+        
         optimizer = optim.AdamW([
-            {'params': mlp_params, 'lr': lr},
-            {'params': basis_params, 'lr': lr * 0.2}  # 5x smaller LR
+            {'params': mlp_params, 'lr': lr, 'name': 'mlp'},
+            {'params': basis_params, 'lr': initial_basis_lr, 'name': 'basis'}
         ], weight_decay=float(config.get('weight_decay', 1e-5)))
         
-        # Store initial learning rates for warmup
+        # Store initial learning rates for warmup and unfreezing
         for param_group in optimizer.param_groups:
             param_group['initial_lr'] = param_group['lr']
+            if param_group.get('name') == 'basis':
+                param_group['target_lr'] = lr * basis_lr_ratio  # Target lr after unfreezing
 
-        print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*0.2:.2e})")
+        if basis_unfreeze_epoch > 0:
+            print(f"Spatial basis: LEARNABLE (Progressive unfreezing)")
+            print(f"  - Epoch 0-{basis_unfreeze_epoch-1}: Basis FROZEN (lr=0)")
+            print(f"  - Epoch {basis_unfreeze_epoch}+: Basis unfrozen (target lr={lr*basis_lr_ratio:.2e})")
+            if basis_lr_rampup_epochs > 0:
+                print(f"  - Rampup over {basis_lr_rampup_epochs} epochs")
+        else:
+            print(f"Spatial basis: LEARNABLE (MLP lr={lr:.2e}, Basis lr={lr*basis_lr_ratio:.2e})")
     else:
         # Fixed basis: only optimize MLP parameters
         # model.spatial_basis has no parameters when learnable=False (uses buffers)
@@ -290,16 +308,23 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     # Scheduler
     scheduler = None
     if config.get('scheduler') == 'cosine':
-        eta_min = lr * 0.3  # Minimum LR = 30% of initial LR
+        eta_min = lr * 0.5  # Minimum LR = 50% of initial LR
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=config.get('epochs', 100),
             eta_min=eta_min
         )
-        print(f"Cosine scheduler: lr={lr:.2e} → eta_min={eta_min:.2e} (10% of initial)")
+        print(f"Cosine scheduler: lr={lr:.2e} → eta_min={eta_min:.2e} (50% of initial)")
     
     if warmup_steps > 0:
         print(f"Using warmup: {warmup_epochs} epochs ({warmup_steps} steps)")
+    
+    # Initialize EMA
+    # Decay = 1 - 1/(10 * batches_per_epoch)
+    batches_per_epoch = len(train_loader)
+    ema_decay = 1.0 - 1.0 / (10.0 * batches_per_epoch)
+    ema = ModelEMA(model, decay=ema_decay)
+    print(f"EMA initialized: decay={ema_decay:.6f} (batches_per_epoch={batches_per_epoch})")
     
     criterion = nn.MSELoss()
     epochs = config.get('epochs', 100)
@@ -314,10 +339,37 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         'lr': []
     }
     
+    # Track basis centers evolution every 100 epochs
+    basis_centers_history = []  # List of (epoch, centers) tuples
+    center_record_interval = 100
+    
     best_model_path = output_dir / 'model_best.pt'
     global_step = 0  # Track global training step for warmup
     
     for epoch in range(epochs):
+        # Progressive unfreezing: adjust basis learning rate at specific epochs
+        if config.get('spatial_learnable', False) and basis_unfreeze_epoch > 0:
+            if epoch == basis_unfreeze_epoch:
+                # Unfreeze basis centers
+                for param_group in optimizer.param_groups:
+                    if param_group.get('name') == 'basis':
+                        if basis_lr_rampup_epochs > 0:
+                            # Start with small lr, will ramp up gradually
+                            param_group['lr'] = param_group['target_lr'] * 0.1
+                            print(f"\n🔓 Epoch {epoch}: Basis UNFROZEN (starting lr={param_group['lr']:.2e})")
+                        else:
+                            # Jump to target lr immediately
+                            param_group['lr'] = param_group['target_lr']
+                            print(f"\n🔓 Epoch {epoch}: Basis UNFROZEN (lr={param_group['lr']:.2e})")
+            
+            elif basis_unfreeze_epoch < epoch < basis_unfreeze_epoch + basis_lr_rampup_epochs:
+                # Gradually increase basis lr during rampup period
+                rampup_progress = (epoch - basis_unfreeze_epoch) / basis_lr_rampup_epochs
+                for param_group in optimizer.param_groups:
+                    if param_group.get('name') == 'basis':
+                        # Linear rampup from 10% to 100% of target lr
+                        param_group['lr'] = param_group['target_lr'] * (0.1 + 0.9 * rampup_progress)
+        
         # Training
         model.train()
         train_loss = 0.0
@@ -350,12 +402,45 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     movement_penalty = model.compute_movement_penalty()
                     loss = loss + movement_penalty_weight * movement_penalty
             
+            # Add sparsity penalty on first layer weights
+            sparsity_type = config.get('sparsity_penalty_type', 'none')
+            if sparsity_type != 'none':
+                lambda_l1 = config.get('sparsity_lambda_l1', 0.001)
+                lambda_group = config.get('sparsity_lambda_group', 0.01)
+                apply_spatial = config.get('sparsity_apply_to_spatial', True)
+                apply_temporal = config.get('sparsity_apply_to_temporal', True)
+                
+                penalties = model.compute_sparsity_penalty(
+                    penalty_type=sparsity_type,
+                    lambda_l1=lambda_l1,
+                    lambda_group=lambda_group
+                )
+                
+                if apply_spatial:
+                    loss = loss + penalties['spatial_penalty']
+                if apply_temporal:
+                    loss = loss + penalties['temporal_penalty']
+            
             loss.backward()
             
+            # Gradient clipping
             if config.get('grad_clip', 0) > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+                # Clip basis gradients more aggressively if learnable
+                if config.get('spatial_learnable', False):
+                    basis_params = list(model.spatial_basis.parameters())
+                    mlp_params = [p for p in model.parameters() if not any(p is bp for bp in basis_params)]
+                    
+                    # Clip basis gradients 10x more aggressively
+                    basis_clip = config['grad_clip'] * 0.1
+                    torch.nn.utils.clip_grad_norm_(basis_params, basis_clip)
+                    torch.nn.utils.clip_grad_norm_(mlp_params, config['grad_clip'])
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
             
             optimizer.step()
+            
+            # Update EMA after optimizer step
+            ema.update(model)
             
             # Apply warmup by manually adjusting learning rate
             if global_step < warmup_steps:
@@ -380,8 +465,10 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         
         train_loss /= len(train_loader)
         
-        # Validation
+        # Validation with EMA model
         model.eval()
+        ema.apply_shadow()  # Use EMA parameters for validation
+        
         val_loss = 0.0
         val_preds = []
         val_trues = []
@@ -400,6 +487,8 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 
                 val_preds.append(y_pred.cpu().numpy())
                 val_trues.append(y.cpu().numpy())
+        
+        ema.restore()  # Restore original parameters for training
         
         val_loss /= len(val_loader)
         
@@ -428,11 +517,14 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             # During warmup, show current LR
             output_str += f", LR={current_lr:.6f}(warmup)"
         
-        # Save best model
+        # Save best model (EMA version)
         if not np.isnan(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
+            # Save EMA model as best model
+            ema.apply_shadow()
             torch.save(model.state_dict(), best_model_path)
+            ema.restore()
             output_str += " ✓ Best"
         else:
             patience_counter += 1
@@ -443,6 +535,12 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         except (ValueError, OSError):
             pass  # stdout closed in parallel mode
         
+        # Record basis centers every 100 epochs (if learnable)
+        if config.get('spatial_learnable', False) and (epoch + 1) % center_record_interval == 0:
+            with torch.no_grad():
+                centers = model.spatial_basis.centers.cpu().numpy().copy()
+                basis_centers_history.append((epoch + 1, centers))
+        
         if patience_counter >= patience:
             try:
                 print(f"\nEarly stopping triggered at epoch {epoch+1}")
@@ -450,13 +548,14 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 pass
             break
     
-    # Load best model if it exists
+    # Load best model (EMA version) if it exists
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path))
-        print(f"\nTraining Complete! Best Val Loss: {best_val_loss:.6f}")
+        print(f"\nTraining Complete! Best Val Loss: {best_val_loss:.6f} (EMA model)")
     else:
-        print(f"\n⚠️ Training failed - no valid model saved!")
-        print(f"Try: 1) Lower learning rate, 2) Set spatial_learnable=false, 3) Increase grad_clip")
+        # If no best model, use final EMA model
+        ema.apply_shadow()
+        print(f"\n⚠️ No best model saved, using final EMA model")
     
     # Save training history
     import pandas as pd
@@ -470,7 +569,8 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     history_df.to_csv(output_dir / 'training_history.csv', index=False)
     print(f"Training history saved to: {output_dir / 'training_history.csv'}")
     
-    return model, history
+    # Return history and basis centers trajectory
+    return model, history, basis_centers_history
 
 
 def evaluate_model(model, data_loader, device):
@@ -885,7 +985,7 @@ def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_di
     print(f"Observation pattern plot saved to {save_path}")
 
 
-def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, config):
+def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, config, basis_centers_history=None):
     """
     Plot spatial basis centers before and after training
     
@@ -895,6 +995,7 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
         train_coords: (N, 2) training coordinates
         output_dir: output directory
         config: configuration dict
+        basis_centers_history: list of (epoch, centers) tuples recording trajectory every 100 epochs
     """
     matplotlib.use('Agg')
     
@@ -908,6 +1009,58 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
     learnable = config.get('spatial_learnable', False)
     init_method = config.get('spatial_init_method', 'uniform')
     k_spatial_centers = config.get('k_spatial_centers', [25, 81, 121])
+    
+    # Detect inactive basis (zero weights from Group Lasso)
+    inactive_basis_mask = None
+    sparsity_type = config.get('sparsity_penalty_type', 'none')
+    if sparsity_type in ['group', 'sparse_group']:
+        # Extract first layer weights for spatial basis
+        first_layer_weight = model_final.mlp[0].weight.data  # (hidden_dim, hidden_dim)
+        
+        # Get spatial basis weights
+        p = config.get('p_covariates', 0)
+        k_spatial = model_final.k_spatial
+        spatial_weights = first_layer_weight[:, p:p+k_spatial].T  # (k_spatial, hidden_dim)
+        
+        # Compute L2 norm for each basis (row)
+        basis_norms = torch.norm(spatial_weights, dim=1).cpu().numpy()  # (k_spatial,)
+        
+        # Mark basis as inactive if norm is very small relative to max
+        # Use configurable threshold (default: 1% of max norm)
+        # This accounts for the fact that Group Lasso creates "small but nonzero" values
+        # due to (1) bias terms, (2) Adam momentum, (3) numerical stability
+        if basis_norms.max() > 0:
+            relative_threshold = config.get('sparsity_threshold_ratio', 1e-2)  # Default: 1% of max
+            threshold = relative_threshold * basis_norms.max()
+        else:
+            threshold = 0.0
+        
+        inactive_basis_mask = basis_norms < threshold
+        
+        n_inactive = inactive_basis_mask.sum()
+        n_active = (~inactive_basis_mask).sum()
+        
+        # Show detailed statistics
+        print(f"\n  📊 Sparsity Analysis ({sparsity_type} penalty):")
+        print(f"     Active basis: {n_active}/{len(inactive_basis_mask)}")
+        print(f"     Removed basis: {n_inactive}/{len(inactive_basis_mask)} (norm < {threshold:.4f})")
+        print(f"     Basis norms: min={basis_norms.min():.4f}, max={basis_norms.max():.4f}, "
+              f"median={np.median(basis_norms):.4f}, mean={basis_norms.mean():.4f}")
+        
+        # Show distribution of norms
+        sorted_norms = np.sort(basis_norms)
+        percentiles = [10, 25, 50, 75, 90]
+        percentile_values = np.percentile(sorted_norms, percentiles)
+        print(f"     Percentiles: ", end="")
+        for p, v in zip(percentiles, percentile_values):
+            print(f"P{p}={v:.4f} ", end="")
+        print()
+        
+        # Count how many are "very small" (different thresholds)
+        very_small_1e3 = (basis_norms < 1e-3 * basis_norms.max()).sum()
+        very_small_1e2 = (basis_norms < 1e-2 * basis_norms.max()).sum()
+        very_small_1e1 = (basis_norms < 1e-1 * basis_norms.max()).sum()
+        print(f"     Small norms: <0.1%max: {very_small_1e3}, <1%max: {very_small_1e2}, <10%max: {very_small_1e1}")
 
     # Sample training data for visualization (max 20000 points)
     max_train_vis = 20000
@@ -981,13 +1134,27 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
     # Count out-of-domain centers
     out_of_domain = ((centers_final < 0) | (centers_final > 1)).any(axis=1).sum()
     
+    # Plot basis centers with different alpha for inactive ones
     for i, (center, size, color) in enumerate(zip(centers_final, sizes_final, colors)):
+        # Determine alpha based on whether basis is active or inactive
+        if inactive_basis_mask is not None and inactive_basis_mask[i]:
+            alpha = 0.15  # Very faint for inactive basis
+            edge_alpha = 0.3
+        else:
+            alpha = 0.6  # Normal for active basis
+            edge_alpha = 1.0
+        
         ax.scatter(center[0], center[1], c=color, s=size, marker='o', 
-                  alpha=0.6, edgecolors='black', linewidths=0.5)
+                  alpha=alpha, edgecolors='black', linewidths=0.5)
     
+    # Update title with sparsity info
     title_suffix = ' (LEARNED)' if learnable else ' (FIXED - same as initial)'
     if learnable and out_of_domain > 0:
         title_suffix += f'\n⚠️ {out_of_domain} centers out-of-domain'
+    if inactive_basis_mask is not None:
+        n_inactive = inactive_basis_mask.sum()
+        n_active = (~inactive_basis_mask).sum()
+        title_suffix += f'\n🎯 {n_active} active, {n_inactive} removed (sparsity)'
     
     ax.set_title(f'Final Basis Centers{title_suffix}', fontsize=14, fontweight='bold')
     ax.set_xlabel('x', fontsize=12)
@@ -1004,31 +1171,87 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
         ax.scatter(train_coords_vis[:, 0], train_coords_vis[:, 1], 
                   c='lightgray', s=2, alpha=0.3, label='Train data', rasterized=True)
         
-        # Plot movement arrows
-        for i, (c_init, c_final, color) in enumerate(zip(centers_init, centers_final, colors)):
-            # Draw arrow from initial to final
-            dx = c_final[0] - c_init[0]
-            dy = c_final[1] - c_init[1]
-            distance = np.sqrt(dx**2 + dy**2)
+        # Plot movement paths as polylines
+        if basis_centers_history is not None and len(basis_centers_history) > 0:
+            # Build complete trajectory: initial -> intermediate points -> final
+            trajectory = []
+            trajectory.append((0, centers_init))  # Epoch 0: initial
+            trajectory.extend(basis_centers_history)  # Intermediate epochs (every 100)
+            trajectory.append((-1, centers_final))  # Final epoch
             
-            if distance > 0.005:  # Only show significant movements
-                ax.arrow(c_init[0], c_init[1], dx, dy,
-                        head_width=0.015, head_length=0.01, 
-                        fc=color, ec='black', alpha=0.5, linewidth=0.5)
+            # Draw polyline for each basis center
+            for i in range(len(centers_init)):
+                # Skip inactive basis in movement visualization
+                if inactive_basis_mask is not None and inactive_basis_mask[i]:
+                    continue
+                
+                # Extract trajectory for this basis
+                path = np.array([traj[1][i] for traj in trajectory])
+                
+                # Compute total path length to decide if we should show it
+                total_distance = np.sum(np.linalg.norm(path[1:] - path[:-1], axis=1))
+                
+                if total_distance > 0.005:  # Only show significant movements
+                    # Draw polyline (no markers at intermediate points)
+                    ax.plot(path[:, 0], path[:, 1], 
+                           color=colors[i], alpha=0.5, linewidth=1.5, zorder=1)
+        else:
+            # Fallback: draw straight arrows (original behavior)
+            for i, (c_init, c_final, color) in enumerate(zip(centers_init, centers_final, colors)):
+                # Skip inactive basis in movement visualization
+                if inactive_basis_mask is not None and inactive_basis_mask[i]:
+                    continue
+                
+                # Draw arrow from initial to final
+                dx = c_final[0] - c_init[0]
+                dy = c_final[1] - c_init[1]
+                distance = np.sqrt(dx**2 + dy**2)
+                
+                if distance > 0.005:  # Only show significant movements
+                    ax.arrow(c_init[0], c_init[1], dx, dy,
+                            head_width=0.015, head_length=0.01, 
+                            fc=color, ec='black', alpha=0.5, linewidth=0.5)
         
-        # Plot initial (hollow) and final (filled) positions
-        ax.scatter(centers_init[:, 0], centers_init[:, 1], 
-                  c='white', s=80, marker='o', alpha=0.8, 
-                  edgecolors='black', linewidths=1.5, label='Initial')
-        ax.scatter(centers_final[:, 0], centers_final[:, 1], 
-                  c=colors, s=80, marker='o', alpha=0.8, 
-                  edgecolors='black', linewidths=1.5, label='Final')
+        # Plot initial and final positions
+        # Separate active and inactive basis
+        if inactive_basis_mask is not None:
+            # Plot active basis (normal)
+            active_mask = ~inactive_basis_mask
+            if active_mask.any():
+                ax.scatter(centers_init[active_mask, 0], centers_init[active_mask, 1], 
+                          c='white', s=16, marker='o', alpha=0.8, 
+                          edgecolors='black', linewidths=1.5, label='Initial (active)', zorder=2)
+                ax.scatter(centers_final[active_mask, 0], centers_final[active_mask, 1], 
+                          c=np.array(colors)[active_mask], s=80, marker='o', alpha=0.8, 
+                          edgecolors='black', linewidths=1.5, label='Final (active)', zorder=2)
+            
+            # Plot inactive basis (faded)
+            if inactive_basis_mask.any():
+                ax.scatter(centers_init[inactive_basis_mask, 0], centers_init[inactive_basis_mask, 1], 
+                          c='white', s=8, marker='o', alpha=0.2, 
+                          edgecolors='gray', linewidths=0.5, label='Removed by sparsity', zorder=2)
+                ax.scatter(centers_final[inactive_basis_mask, 0], centers_final[inactive_basis_mask, 1], 
+                          c=np.array(colors)[inactive_basis_mask], s=40, marker='o', alpha=0.2, 
+                          edgecolors='gray', linewidths=0.5, zorder=2)
+        else:
+            # Original behavior when no sparsity
+            ax.scatter(centers_init[:, 0], centers_init[:, 1], 
+                      c='white', s=16, marker='o', alpha=0.8, 
+                      edgecolors='black', linewidths=1.5, label='Initial', zorder=2)
+            ax.scatter(centers_final[:, 0], centers_final[:, 1], 
+                      c=colors, s=80, marker='o', alpha=0.8, 
+                      edgecolors='black', linewidths=1.5, label='Final', zorder=2)
         
-        # Compute movement statistics
-        movements = np.linalg.norm(centers_final - centers_init, axis=1)
-        mean_movement = movements.mean()
-        max_movement = movements.max()
-        median_movement = np.median(movements)
+        # Compute movement statistics (only for active basis)
+        if inactive_basis_mask is not None:
+            active_mask = ~inactive_basis_mask
+            movements = np.linalg.norm(centers_final[active_mask] - centers_init[active_mask], axis=1)
+        else:
+            movements = np.linalg.norm(centers_final - centers_init, axis=1)
+        
+        mean_movement = movements.mean() if len(movements) > 0 else 0
+        max_movement = movements.max() if len(movements) > 0 else 0
+        median_movement = np.median(movements) if len(movements) > 0 else 0
         
         # Get penalty weights from config
         movement_penalty = config.get('movement_penalty_weight', 0.0)
@@ -1255,7 +1478,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     print("\n" + "="*50)
     print("Training Model")
     print("="*50)
-    model, history = train_model(model, train_loader, val_loader, config, device, output_dir)
+    model, history, basis_centers_history = train_model(model, train_loader, val_loader, config, device, output_dir)
     
     # Evaluate on all sets
     print("\n" + "="*50)
@@ -1375,7 +1598,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
             train_coords_list.append(sample['coords'].numpy())
         train_coords = np.array(train_coords_list)
     
-    plot_basis_evolution(model_initial, model, train_coords, output_dir, config)
+    plot_basis_evolution(model_initial, model, train_coords, output_dir, config, basis_centers_history)
     
     print("\n" + "="*70)
     print(f"EXPERIMENT {experiment_id} COMPLETE!")

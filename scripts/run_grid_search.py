@@ -256,12 +256,17 @@ def main():
     # Define parameter grid
     param_grid = {
         'data_file': ['data/2b/2b_8.csv'],
+        # 'spatial_basis_function': ['wendland', 'gaussian', 'triangular'],  # NEW: Phase 1
         'spatial_basis_function': ['wendland'],  # NEW: Phase 1
-        'spatial_init_method': ['uniform', 'gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
-        'spatial_learnable': [True, False],
-        'obs_method': ['random'],
+        # 'spatial_init_method': ['uniform', 'gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
+        'spatial_init_method': ['gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
+        # 'spatial_learnable': [True, False],
+        'spatial_learnable': [True],
+        'obs_method': ['site-wise', 'random'],
+        # 'obs_method': ['random'],
         'obs_ratio': [0.05],
-        'obs_spatial_pattern': ['corner'],
+        'obs_spatial_pattern': ['corner', 'uniform'],
+        # 'obs_spatial_pattern': ['corner'],
     }
     
     # Define filter function for conditional combinations
@@ -305,7 +310,8 @@ def main():
     print(f"\nOutput directory: {output_dir}")
     print(f"Parallel execution: {args.parallel}")
     if args.parallel:
-        print(f"Number of parallel jobs: {args.n_jobs}")
+        print(f"Number of parallel jobs (configs): {args.n_jobs}")
+        print(f"Note: Experiments within each config will run sequentially to avoid nested parallelism issues")
     
     # Device
     device = base_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -317,7 +323,7 @@ def main():
     all_results = []
     
     if args.parallel:
-        # Parallel execution
+        # Parallel execution at config level (experiments run sequentially within each config)
         from joblib import Parallel, delayed
         
         def run_config_wrapper(config, config_idx):
@@ -343,11 +349,14 @@ def main():
                 start_exp_id = config.get('start_exp_id', None)
                 end_exp_id = config.get('end_exp_id', None)
                 
+                # IMPORTANT: When running configs in parallel (outer level),
+                # experiments must run sequentially (inner level) to avoid
+                # nested parallelism which causes "result_handler not alive" error
                 summary = run_multiple_experiments(
                     config, 
                     config_output_dir, 
                     device,
-                    parallel=True,
+                    parallel=False,  # Changed from True to False to prevent nested parallelism
                     start_exp_id=start_exp_id,
                     end_exp_id=end_exp_id
                 )

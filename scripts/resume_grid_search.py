@@ -239,6 +239,7 @@ def generate_grid_summary(grid_dir, config_dirs):
         record = {
             'config_id': config.get('config_id', 'unknown'),
             'tag': config.get('tag', 'unknown'),
+            'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),  # Added
             'spatial_init_method': config.get('spatial_init_method'),
             'spatial_learnable': config.get('spatial_learnable'),
             'obs_method': config.get('obs_method'),
@@ -301,6 +302,7 @@ def generate_grid_summary(grid_dir, config_dirs):
                             'config_id': config.get('config_id'),
                             'tag': config.get('tag'),
                             'experiment_id': exp_id,
+                            'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),  # Added
                             'spatial_init_method': config.get('spatial_init_method'),
                             'spatial_learnable': config.get('spatial_learnable'),
                             'obs_method': config.get('obs_method'),

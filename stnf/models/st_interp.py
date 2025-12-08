@@ -61,12 +61,16 @@ class SpatialBasisEmbedding(nn.Module):
     
     def __init__(self, n_centers: list = [25, 81, 121], learnable: bool = False,
                  init_method: str = 'uniform', train_coords: np.ndarray = None,
-                 basis_function: str = 'wendland'):
+                 basis_function: str = 'wendland', gradient_damping: bool = False,
+                 damping_threshold: float = 0.3, damping_strength: float = 1.0):
         super().__init__()
         self.n_centers = n_centers
         self.learnable = learnable
         self.init_method = init_method
         self.basis_function = basis_function
+        self.gradient_damping = gradient_damping
+        self.damping_threshold = damping_threshold  # Distance threshold before damping starts
+        self.damping_strength = damping_strength    # Strength of damping effect
         
         # Validate basis function
         if basis_function not in self.CALIBRATION_FACTORS:
@@ -94,11 +98,48 @@ class SpatialBasisEmbedding(nn.Module):
             self.register_buffer('centers_init', centers.clone())
             # Store log(bandwidth) to ensure positivity: bandwidth = exp(log_bandwidth)
             self.log_bandwidths = nn.Parameter(torch.log(bandwidths))
+            
+            # Register gradient hook for distance-based damping
+            if gradient_damping:
+                self.centers.register_hook(self._gradient_damping_hook)
         else:
             self.register_buffer('centers', centers)
             self.register_buffer('_bandwidths', bandwidths)  # Use _ prefix to avoid property conflict
         
         self.k = centers.shape[0]
+    
+    def _gradient_damping_hook(self, grad):
+        """
+        Gradient hook that applies distance-based damping to center movements.
+        
+        Bases that have moved far from initial positions get reduced gradients,
+        preventing them from flying away while allowing small beneficial movements.
+        
+        Damping function:
+        - distance < threshold: no damping (factor = 1.0)
+        - distance >= threshold: exponential damping based on excess distance
+        
+        Args:
+            grad: gradient tensor (k, 2)
+            
+        Returns:
+            damped_grad: gradient with distance-based damping applied
+        """
+        with torch.no_grad():
+            # Compute distance from initial position for each center
+            movement = self.centers - self.centers_init  # (k, 2)
+            distances = torch.norm(movement, dim=1, keepdim=True)  # (k, 1)
+            
+            # Compute damping factor
+            # For distance < threshold: factor = 1.0 (no damping)
+            # For distance >= threshold: factor = exp(-strength * (distance - threshold))
+            excess_distance = torch.clamp(distances - self.damping_threshold, min=0.0)
+            damping_factor = torch.exp(-self.damping_strength * excess_distance)  # (k, 1)
+            
+            # Apply damping to gradient
+            damped_grad = grad * damping_factor
+            
+        return damped_grad
     
     @property
     def bandwidths(self):
@@ -575,7 +616,10 @@ class STInterpMLP(nn.Module):
                  spatial_learnable: bool = False,
                  spatial_init_method: str = 'uniform',
                  spatial_basis_function: str = 'wendland',
-                 train_coords: np.ndarray = None):
+                 train_coords: np.ndarray = None,
+                 gradient_damping: bool = False,
+                 damping_threshold: float = 0.3,
+                 damping_strength: float = 1.0):
         super().__init__()
         
         self.p = p
@@ -589,7 +633,10 @@ class STInterpMLP(nn.Module):
             learnable=spatial_learnable,
             init_method=spatial_init_method,
             train_coords=train_coords,
-            basis_function=spatial_basis_function
+            basis_function=spatial_basis_function,
+            gradient_damping=gradient_damping,
+            damping_threshold=damping_threshold,
+            damping_strength=damping_strength
         )
         
         # Temporal basis embedding
@@ -637,6 +684,105 @@ class STInterpMLP(nn.Module):
         """
         return self.spatial_basis.compute_movement_penalty()
     
+    def compute_sparsity_penalty(self, penalty_type='element', lambda_l1=0.01, lambda_group=0.01):
+        """
+        Compute sparsity penalty on first layer weights connected to spatial/temporal embeddings
+        
+        Supports three types:
+        1. 'element': Element-wise L1 penalty (connection selection)
+        2. 'group': Group Lasso penalty (basis selection)
+        3. 'sparse_group': Sparse Group Lasso (both basis and connection selection)
+        
+        Args:
+            penalty_type: 'element', 'group', or 'sparse_group'
+            lambda_l1: Weight for element-wise L1 penalty
+            lambda_group: Weight for group Lasso penalty
+            
+        Returns:
+            dict with 'spatial_penalty', 'temporal_penalty', and 'total_penalty'
+        """
+        if penalty_type not in ['element', 'group', 'sparse_group', 'none']:
+            raise ValueError(f"Unknown penalty_type: {penalty_type}")
+        
+        if penalty_type == 'none':
+            return {
+                'spatial_penalty': torch.tensor(0.0, device=next(self.parameters()).device),
+                'temporal_penalty': torch.tensor(0.0, device=next(self.parameters()).device),
+                'total_penalty': torch.tensor(0.0, device=next(self.parameters()).device)
+            }
+        
+        # Get first layer weight matrix
+        first_layer = self.mlp[0]  # First Linear layer
+        weight = first_layer.weight  # (hidden_dim, input_dim)
+        
+        # Split weight matrix by input features: [X, φ(s), ψ(t)]
+        # Input structure: [p_covariates, k_spatial, k_temporal]
+        idx = 0
+        
+        # Skip covariates (no penalty on them)
+        if self.p > 0:
+            idx += self.p
+        
+        # Extract spatial basis weights
+        spatial_weight = weight[:, idx:idx+self.k_spatial].T  # (k_spatial, hidden_dim)
+        idx += self.k_spatial
+        
+        # Extract temporal basis weights
+        temporal_weight = weight[:, idx:idx+self.k_temporal].T  # (k_temporal, hidden_dim)
+        
+        # Compute penalties based on type
+        spatial_penalty = self._compute_penalty_for_block(
+            spatial_weight, penalty_type, lambda_l1, lambda_group
+        )
+        temporal_penalty = self._compute_penalty_for_block(
+            temporal_weight, penalty_type, lambda_l1, lambda_group
+        )
+        
+        return {
+            'spatial_penalty': spatial_penalty,
+            'temporal_penalty': temporal_penalty,
+            'total_penalty': spatial_penalty + temporal_penalty
+        }
+    
+    def _compute_penalty_for_block(self, weight_block, penalty_type, lambda_l1, lambda_group):
+        """
+        Compute penalty for a weight block (e.g., spatial or temporal)
+        
+        Args:
+            weight_block: (n_basis, hidden_dim) weight matrix
+            penalty_type: 'element', 'group', or 'sparse_group'
+            lambda_l1: Element-wise L1 penalty weight
+            lambda_group: Group Lasso penalty weight
+            
+        Returns:
+            penalty: scalar tensor
+        """
+        if penalty_type == 'element':
+            # Element-wise L1: sum of absolute values
+            return lambda_l1 * weight_block.abs().sum()
+        
+        elif penalty_type == 'group':
+            # Group Lasso: sum of L2 norms of each basis's weight vector
+            penalty = 0
+            for i in range(weight_block.shape[0]):
+                penalty += weight_block[i, :].norm(2)
+            return lambda_group * penalty
+        
+        elif penalty_type == 'sparse_group':
+            # Sparse Group Lasso: combination of both
+            # Group penalty (basis selection)
+            group_penalty = 0
+            for i in range(weight_block.shape[0]):
+                group_penalty += weight_block[i, :].norm(2)
+            
+            # Element penalty (connection selection)
+            element_penalty = weight_block.abs().sum()
+            
+            return lambda_group * group_penalty + lambda_l1 * element_penalty
+        
+        else:
+            return torch.tensor(0.0, device=weight_block.device)
+    
     def forward(self, X: torch.Tensor, coords: torch.Tensor, t: torch.Tensor):
         """
         X: (B, p) or (N, p) - covariates (can be empty if p=0)
@@ -681,5 +827,8 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         spatial_learnable=config.get('spatial_learnable', False),
         spatial_init_method=config.get('spatial_init_method', 'uniform'),
         spatial_basis_function=config.get('spatial_basis_function', 'wendland'),
-        train_coords=train_coords
+        train_coords=train_coords,
+        gradient_damping=config.get('gradient_damping', False),
+        damping_threshold=config.get('damping_threshold', 0.3),
+        damping_strength=config.get('damping_strength', 1.0)
     )

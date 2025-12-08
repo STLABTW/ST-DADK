@@ -12,8 +12,24 @@ k_temporal_centers: [10, 15, 45]  # Temporal basis centers (Gaussian RBF)
 spatial_basis_function: wendland      # Spatial basis function: 'wendland', 'gaussian', or 'triangular'
 spatial_init_method: gmm              # Spatial basis initialization: 'uniform' (grid) or 'gmm' (data-adaptive)
 spatial_learnable: true               # Whether spatial basis centers are learnable
-domain_penalty_weight: 0.01           # Penalty weight for centers outside [0,1]^2 (0=no penalty, 0.01-1.0 recommended)
-movement_penalty_weight: 0.0          # Penalty weight for centers moving from initial positions (0=no penalty, 0.0001-0.01 recommended)
+
+# Gradient-based movement control (alternative to movement_penalty)
+gradient_damping: true                # Enable distance-based gradient damping (reduces LR for far-moved bases)
+damping_threshold: 0.0                # Distance threshold before damping starts (0.0 = 0% of domain)
+damping_strength: 10.0                 # Strength of damping: higher = stronger suppression of far movements
+
+# Traditional penalty-based movement control (not recommended with gradient_damping)
+domain_penalty_weight: 0.01            # Penalty weight for centers outside [0,1]^2 (0=no penalty, 0.01-1.0 recommended)
+movement_penalty_weight: 0.0          # Penalty weight for centers moving from initial positions (set to 0 when using gradient_damping)
+
+# Sparsity penalty settings
+sparsity_penalty_type: sparse_group   # Sparsity penalty type: 'none', 'element', 'group', or 'sparse_group'
+sparsity_lambda_l1: 0.00001           # Element-wise L1 penalty weight (for 'element' or 'sparse_group') - creates exact zeros!
+sparsity_lambda_group: 0.00001        # Group Lasso penalty weight (for 'group' or 'sparse_group') - encourages group sparsity
+sparsity_apply_to_spatial: true       # Apply sparsity penalty to spatial basis connections
+sparsity_apply_to_temporal: false     # Apply sparsity penalty to temporal basis connections
+sparsity_threshold_ratio: 0.01        # Threshold for "removed" basis = ratio × max_norm (1e-2 = 1% of max)
+
 hidden_dims: [256, 256, 128]          # MLP hidden layer dimensions
 dropout: 0.1                          # Dropout rate
 layernorm: true                       # Use LayerNorm
@@ -29,21 +45,24 @@ train_ratio: 0.8                  # Train/valid split ratio
 normalize_target: false           # Normalize target values
 
 # Training settings
-epochs: 300
-lr: 1e-2
+epochs: 500
+lr: 2e-2                          # Learning rate for MLP
+basis_lr_ratio: 0.01              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
 weight_decay: 5e-4
 batch_size: 512
-patience: 30
-grad_clip: 5.0
+patience: 50
+grad_clip: 10.0                   # Gradient clipping
 scheduler: cosine
-warmup_epochs: 5                  # Number of warmup epochs (linear LR increase from 0 to lr)
-num_workers: 0                    # DataLoader workers per experiment (0=single process, 2-4=recommended for CPU)
+warmup_epochs: 20                 # Number of warmup epochs (linear LR increase from 0 to lr)
+
+# Progressive unfreezing settings (for spatial_learnable=true)
+basis_unfreeze_epoch: 100          # Epoch to unfreeze basis centers (0=train from start, >0=freeze then unfreeze)
+basis_lr_rampup_epochs: 20        # Epochs to gradually ramp up basis lr after unfreezing (0=instant)
 
 # Experiment settings
-n_experiments: 2                 # Number of repeated experiments (M)
+n_experiments: 10                 # Number of repeated experiments (M)
 base_seed: 42                     # Base seed (each experiment uses base_seed + i)
-parallel: true                    # Run experiments in parallel
-n_jobs: 2                         # Number of parallel jobs (32 cores / 8 configs = 4)
+num_workers: 0                    # DataLoader workers per experiment (set to 0 when using parallel grid search)
 
 # Device
 device: cpu

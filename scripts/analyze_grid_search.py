@@ -305,6 +305,102 @@ def main():
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"  ✓ Saved: {save_path}")
         plt.close()
+        
+        # ========================================================================
+        # Generate aggregated plots (one parameter ignored at a time)
+        # ========================================================================
+        print(f"  📊 Generating aggregated plots...")
+        
+        for param_to_ignore in varying_params:
+            # Create aggregated method labels (without the ignored parameter)
+            remaining_params = [p for p in varying_params if p != param_to_ignore]
+            
+            if len(remaining_params) == 0:
+                continue
+            
+            df_file['agg_method'] = df_file.apply(
+                lambda row: create_method_label(row, remaining_params), axis=1
+            )
+            
+            agg_methods = sorted(df_file['agg_method'].unique())
+            agg_colors = assign_colors(agg_methods)
+            
+            # Create figure
+            fig_agg, axes_agg = plt.subplots(n_rows, n_cols, 
+                                            figsize=(6 * n_cols, 5 * n_rows),
+                                            squeeze=False)
+            
+            fig_agg.suptitle(f'Performance Comparison: {data_file}\n(Aggregated over {param_to_ignore})', 
+                            fontsize=16, fontweight='bold', y=0.995)
+            
+            # Plot each subplot
+            for row_idx, pattern in enumerate(obs_patterns):
+                for col_idx, (obs_method, obs_ratio) in enumerate(col_configs):
+                    ax = axes_agg[row_idx, col_idx]
+                    
+                    # Filter data for this subplot
+                    df_subplot = df_file[
+                        (df_file['obs_spatial_pattern'] == pattern) &
+                        (df_file['obs_method'] == obs_method) &
+                        (df_file['obs_ratio'] == obs_ratio)
+                    ]
+                    
+                    if len(df_subplot) == 0:
+                        ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+                               transform=ax.transAxes, fontsize=14)
+                        ax.set_title(f'{pattern.capitalize()} | {obs_method}, r={obs_ratio}', 
+                                    fontsize=11, fontweight='bold')
+                        continue
+                    
+                    # Prepare data for boxplot (aggregated)
+                    data_for_plot = []
+                    labels_for_plot = []
+                    colors_for_plot = []
+                    
+                    for agg_method in agg_methods:
+                        df_method = df_subplot[df_subplot['agg_method'] == agg_method]
+                        if len(df_method) > 0:
+                            data_for_plot.append(df_method['test_rmse'].values)
+                            labels_for_plot.append(agg_method)
+                            colors_for_plot.append(agg_colors[agg_method])
+                    
+                    if len(data_for_plot) == 0:
+                        ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+                               transform=ax.transAxes, fontsize=14)
+                        ax.set_title(f'{pattern.capitalize()} | {obs_method}, r={obs_ratio}', 
+                                    fontsize=11, fontweight='bold')
+                        continue
+                    
+                    # Create boxplot
+                    positions = np.arange(len(data_for_plot))
+                    bp = ax.boxplot(data_for_plot, positions=positions,
+                                   widths=0.6, patch_artist=True,
+                                   medianprops=dict(color='black', linewidth=2),
+                                   whiskerprops=dict(linewidth=1.5),
+                                   capprops=dict(linewidth=1.5),
+                                   flierprops=dict(marker='o', markersize=5, alpha=0.5))
+                    
+                    # Color boxes
+                    for patch, color in zip(bp['boxes'], colors_for_plot):
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.7)
+                    
+                    # Set labels
+                    ax.set_xticks(positions)
+                    ax.set_xticklabels(labels_for_plot, rotation=45, ha='right', fontsize=9)
+                    ax.set_ylabel('Test RMSE', fontsize=10, fontweight='bold')
+                    ax.set_title(f'{pattern.capitalize()} | {obs_method}, r={obs_ratio}', 
+                                fontsize=11, fontweight='bold')
+                    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+            
+            plt.tight_layout()
+            
+            # Save aggregated figure
+            agg_filename = data_file.replace('/', '_').replace('.csv', f'_agg_no_{param_to_ignore}.png')
+            save_path_agg = output_dir / agg_filename
+            plt.savefig(save_path_agg, dpi=300, bbox_inches='tight')
+            print(f"     ✓ Aggregated plot (no {param_to_ignore}): {save_path_agg}")
+            plt.close()
     
     # ========================================================================
     # Summary Statistics
