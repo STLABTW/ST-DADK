@@ -638,7 +638,7 @@ def plot_training_curves(history, save_path):
     """Plot training curves"""
     matplotlib.use('Agg')
     
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
     
     epochs = range(1, len(history['train_loss']) + 1)
     
@@ -682,6 +682,15 @@ def plot_training_curves(history, save_path):
         # Add 10% margin
         margin = (y_max - y_min) * 0.1
         ax.set_ylim(y_min - margin, y_max + margin)
+    
+    # Learning Rate
+    ax = axes[2]
+    ax.plot(epochs, history['lr'], 'purple', linewidth=2)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Learning Rate')
+    ax.set_title('Learning Rate Schedule')
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')  # Log scale to see changes better
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -1406,9 +1415,29 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     else:
         num_workers = config.get('num_workers', 0)
     
+    # Adjust batch size to ensure at least 10 batches per epoch
+    batch_size = config.get('batch_size', 256)
+    n_train_samples = len(train_dataset)
+    min_batches_per_epoch = 10
+    
+    while n_train_samples / batch_size < min_batches_per_epoch and batch_size > 1:
+        old_batch_size = batch_size
+        batch_size = batch_size // 2
+        batches_per_epoch = n_train_samples / batch_size
+        print(f"⚠️ Batch size {old_batch_size} would result in {n_train_samples / old_batch_size:.1f} batches/epoch")
+        print(f"   Reducing to {batch_size} → {batches_per_epoch:.1f} batches/epoch")
+    
+    if batch_size != config.get('batch_size', 256):
+        print(f"✓ Final train batch size: {batch_size} ({n_train_samples / batch_size:.1f} batches/epoch)")
+    
+    # For validation/test, use larger batch size (no gradient computation needed)
+    # Use 4x train batch size or all data at once, whichever is smaller
+    val_batch_size = min(max(batch_size * 16, 32768), len(val_dataset))
+    test_batch_size = min(max(batch_size * 16, 32768), len(test_dataset))
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.get('batch_size', 256),
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn
@@ -1416,7 +1445,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.get('batch_size', 256),
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn
@@ -1424,7 +1453,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config.get('batch_size', 256),
+        batch_size=test_batch_size,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn

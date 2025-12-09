@@ -16,7 +16,7 @@ spatial_learnable: true               # Whether spatial basis centers are learna
 # Gradient-based movement control (alternative to movement_penalty)
 gradient_damping: true                # Enable distance-based gradient damping (reduces LR for far-moved bases)
 damping_threshold: 0.0                # Distance threshold before damping starts (0.0 = 0% of domain)
-damping_strength: 10.0                 # Strength of damping: higher = stronger suppression of far movements
+damping_strength: 5.0                 # Strength of damping: higher = stronger suppression of far movements
 
 # Traditional penalty-based movement control (not recommended with gradient_damping)
 domain_penalty_weight: 0.01            # Penalty weight for centers outside [0,1]^2 (0=no penalty, 0.01-1.0 recommended)
@@ -46,22 +46,22 @@ normalize_target: false           # Normalize target values
 
 # Training settings
 epochs: 500
-lr: 2e-2                          # Learning rate for MLP
-basis_lr_ratio: 0.01              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
+lr: 1e-2
+basis_lr_ratio: 0.05              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
 weight_decay: 5e-4
-batch_size: 512
+batch_size: 4096
 patience: 50
 grad_clip: 10.0                   # Gradient clipping
 scheduler: cosine
-warmup_epochs: 20                 # Number of warmup epochs (linear LR increase from 0 to lr)
+warmup_epochs: 10                 # Number of warmup epochs (increased for larger batch)
 
 # Progressive unfreezing settings (for spatial_learnable=true)
-basis_unfreeze_epoch: 100          # Epoch to unfreeze basis centers (0=train from start, >0=freeze then unfreeze)
-basis_lr_rampup_epochs: 20        # Epochs to gradually ramp up basis lr after unfreezing (0=instant)
+basis_unfreeze_epoch: 50          # Epoch to unfreeze basis centers (0=train from start, >0=freeze then unfreeze)
+basis_lr_rampup_epochs: 10        # Epochs to gradually ramp up basis lr after unfreezing (0=instant)
 
 # Experiment settings
-n_experiments: 10                 # Number of repeated experiments (M)
-base_seed: 42                     # Base seed (each experiment uses base_seed + i)
+n_experiments: 20                 # Number of repeated experiments (M)
+base_seed: 2025                   # Base seed (each experiment uses base_seed + i)
 num_workers: 0                    # DataLoader workers per experiment (set to 0 when using parallel grid search)
 
 # Device
