@@ -34,6 +34,69 @@ from stnf.dataio.kaust_loader import load_kaust_csv_single
 from stnf.utils import set_seed, compute_metrics, ModelEMA
 
 
+def quantile_loss(y_pred, y_true, quantile):
+    """
+    Compute quantile (check) loss for quantile regression
+    
+    Args:
+        y_pred: predicted values (B,)
+        y_true: true values (B,)
+        quantile: target quantile level (e.g., 0.1, 0.5, 0.9)
+    
+    Returns:
+        Quantile loss
+    """
+    errors = y_true - y_pred
+    return torch.mean(torch.max((quantile - 1) * errors, quantile * errors))
+
+
+def compute_crps(predictions_dict, y_true):
+    """
+    Compute Continuous Ranked Probability Score (CRPS) from quantile predictions
+    
+    Args:
+        predictions_dict: dict of {quantile_level: predictions (N,)}
+        y_true: true values (N,)
+    
+    Returns:
+        CRPS score (lower is better)
+    """
+    # Sort quantiles
+    quantiles = sorted(predictions_dict.keys())
+    
+    if len(quantiles) == 1:
+        # Single quantile: use absolute error
+        q = quantiles[0]
+        return np.mean(np.abs(predictions_dict[q] - y_true))
+    
+    # Multiple quantiles: approximate CRPS using trapezoidal rule
+    crps = 0.0
+    n_samples = len(y_true)
+    
+    for i in range(len(quantiles) - 1):
+        q1, q2 = quantiles[i], quantiles[i + 1]
+        pred1 = predictions_dict[q1]
+        pred2 = predictions_dict[q2]
+        
+        # Indicator: 1 if y_true < predicted quantile
+        indicator1 = (y_true < pred1).astype(float)
+        indicator2 = (y_true < pred2).astype(float)
+        
+        # Integrate using trapezoidal rule
+        weight = q2 - q1
+        crps += weight * np.mean(
+            (indicator1 - q1) * pred1 + (indicator2 - q2) * pred2
+        ) / 2.0
+    
+    # Alternative simpler approximation
+    crps_simple = 0.0
+    for q, pred in predictions_dict.items():
+        indicator = (y_true < pred).astype(float)
+        crps_simple += np.mean(np.abs(indicator - q) * np.abs(pred - y_true))
+    
+    return crps_simple / len(quantiles)
+
+
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
     """
     Create spatial observation probability function
@@ -326,7 +389,20 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     ema = ModelEMA(model, decay=ema_decay)
     print(f"EMA initialized: decay={ema_decay:.6f} (batches_per_epoch={batches_per_epoch})")
     
-    criterion = nn.MSELoss()
+    # Loss function based on regression type
+    regression_type = config.get('regression_type', 'mean')
+    current_quantile = config.get('current_quantile', None)  # Single quantile for this run
+    
+    if regression_type == 'mean':
+        criterion = nn.MSELoss()
+        print(f"Loss function: MSE (mean regression)")
+    elif regression_type == 'quantile':
+        if current_quantile is None:
+            raise ValueError("current_quantile must be specified for quantile regression")
+        print(f"Loss function: Quantile loss (quantile={current_quantile})")
+    else:
+        raise ValueError(f"Unknown regression_type: {regression_type}")
+    
     epochs = config.get('epochs', 100)
     best_val_loss = float('inf')
     patience = config.get('patience', 15)
@@ -385,8 +461,11 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             # Forward pass
             y_pred = model(X, coords, t)
             
-            # Main loss (MSE)
-            loss = criterion(y_pred, y)
+            # Main loss
+            if regression_type == 'mean':
+                loss = criterion(y_pred, y)
+            elif regression_type == 'quantile':
+                loss = quantile_loss(y_pred, y, current_quantile)
             
             # Add regularization penalties for learnable basis centers
             if config.get('spatial_learnable', False):
@@ -482,7 +561,12 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 
                 y_pred = model(X, coords, t)
                 
-                loss = criterion(y_pred, y)
+                # Compute validation loss
+                if regression_type == 'mean':
+                    loss = criterion(y_pred, y)
+                elif regression_type == 'quantile':
+                    loss = quantile_loss(y_pred, y, current_quantile)
+                
                 val_loss += loss.item()
                 
                 val_preds.append(y_pred.cpu().numpy())
@@ -573,12 +657,12 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     return model, history, basis_centers_history
 
 
-def evaluate_model(model, data_loader, device):
+def evaluate_model(model, data_loader, device, config=None):
     """
     Evaluate model on a dataset
     
     Returns:
-        metrics: dict with 'mse' and 'mae'
+        metrics: dict with 'mse', 'mae', and optionally 'check_loss'
     """
     model.eval()
     all_preds = []
@@ -602,11 +686,23 @@ def evaluate_model(model, data_loader, device):
     mse = np.mean((preds - trues) ** 2)
     mae = np.mean(np.abs(preds - trues))
     
-    return {
+    metrics = {
         'mse': float(mse),
         'mae': float(mae),
         'rmse': float(np.sqrt(mse))
     }
+    
+    # Add check loss for quantile regression
+    if config is not None and config.get('regression_type') == 'quantile' and 'current_quantile' in config:
+        q = config['current_quantile']
+        check_loss = quantile_loss(
+            torch.tensor(preds, dtype=torch.float32),
+            torch.tensor(trues, dtype=torch.float32),
+            q
+        ).item()
+        metrics['check_loss'] = float(check_loss)
+    
+    return metrics
 
 
 def save_results(results, output_dir):
@@ -1300,16 +1396,133 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         skip_existing: if True, skip if results.json already exists
     
     Returns:
-        results: dictionary containing all results
+        results: dictionary containing all results (or dict of results per quantile)
     """
-    # Check if results already exist
-    if skip_existing:
-        result_file = output_dir / 'results.json'
-        if result_file.exists():
+    # Check if this is quantile regression with multiple quantiles
+    regression_type = config.get('regression_type', 'mean')
+    quantile_levels = config.get('quantile_levels', [0.5])
+    
+    if regression_type == 'quantile' and len(quantile_levels) > 1:
+        # Run separate experiment for each quantile level
+        if verbose:
+            print("\n" + "="*70)
+            print(f"QUANTILE REGRESSION: Training {len(quantile_levels)} models")
+            print(f"Quantiles: {quantile_levels}")
+            print("="*70)
+        
+        quantile_results = {}
+        quantile_predictions = {}
+        
+        for q_idx, q_level in enumerate(quantile_levels, 1):
             if verbose:
-                print(f"✓ Experiment {experiment_id} already completed, skipping...")
-            with open(result_file, 'r') as f:
-                return json.load(f)
+                print(f"\n{'='*70}")
+                print(f"QUANTILE {q_idx}/{len(quantile_levels)}: τ = {q_level}")
+                print(f"{'='*70}")
+            
+            # Create config for this quantile
+            q_config = config.copy()
+            q_config['current_quantile'] = q_level
+            q_config['regression_type'] = 'quantile'
+            
+            # Create quantile-specific output directory
+            q_output_dir = output_dir / f'quantile_{q_level}'
+            q_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Check if this quantile already exists
+            if skip_existing:
+                q_result_file = q_output_dir / 'results.json'
+                if q_result_file.exists():
+                    if verbose:
+                        print(f"✓ Quantile {q_level} already completed, loading...")
+                    with open(q_result_file, 'r') as f:
+                        quantile_results[q_level] = json.load(f)
+                    
+                    # Load predictions
+                    pred_file = q_output_dir / 'predictions.npz'
+                    if pred_file.exists():
+                        pred_data = np.load(pred_file)
+                        quantile_predictions[q_level] = {
+                            'test': pred_data['test_predictions'],
+                            'valid': pred_data['valid_predictions']
+                        }
+                    continue
+            
+            # Run experiment for this quantile (recursive call with single quantile)
+            q_result = _run_single_quantile_experiment(
+                q_config, experiment_id, q_output_dir, device, 
+                verbose=verbose, parallel_mode=parallel_mode
+            )
+            
+            quantile_results[q_level] = q_result
+            quantile_predictions[q_level] = {
+                'test': q_result.get('test_predictions'),
+                'valid': q_result.get('valid_predictions')
+            }
+        
+        # Compute CRPS across quantiles
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"COMPUTING CRPS ACROSS QUANTILES")
+            print(f"{'='*70}")
+        
+        # Aggregate results
+        test_true = quantile_results[quantile_levels[0]].get('test_true')
+        valid_true = quantile_results[quantile_levels[0]].get('valid_true')
+        
+        test_preds_dict = {q: quantile_predictions[q]['test'] for q in quantile_levels}
+        valid_preds_dict = {q: quantile_predictions[q]['valid'] for q in quantile_levels}
+        
+        test_crps = compute_crps(test_preds_dict, test_true)
+        valid_crps = compute_crps(valid_preds_dict, valid_true)
+        
+        # Average check loss across quantiles
+        test_check_loss = np.mean([quantile_results[q]['test_mse'] for q in quantile_levels])
+        valid_check_loss = np.mean([quantile_results[q]['valid_mse'] for q in quantile_levels])
+        
+        if verbose:
+            print(f"\nTest  CRPS: {test_crps:.6f}")
+            print(f"Valid CRPS: {valid_crps:.6f}")
+            print(f"Test  Check Loss (avg): {test_check_loss:.6f}")
+            print(f"Valid Check Loss (avg): {valid_check_loss:.6f}")
+        
+        # Save aggregated results
+        aggregated_results = {
+            'experiment_id': experiment_id,
+            'regression_type': 'quantile',
+            'quantile_levels': quantile_levels,
+            'quantile_results': quantile_results,
+            'test_crps': float(test_crps),
+            'valid_crps': float(valid_crps),
+            'test_check_loss': float(test_check_loss),
+            'valid_check_loss': float(valid_check_loss),
+            'test_mse': float(test_check_loss),  # For compatibility
+            'valid_mse': float(valid_check_loss),  # For compatibility
+            'test_rmse': float(np.sqrt(test_check_loss)),  # For compatibility
+            'valid_rmse': float(np.sqrt(valid_check_loss)),  # For compatibility
+        }
+        
+        # Use save_results function to handle JSON serialization
+        save_results(aggregated_results, output_dir)
+        
+        return aggregated_results
+    
+    else:
+        # Single quantile or mean regression - use existing logic
+        if regression_type == 'quantile':
+            config['current_quantile'] = quantile_levels[0]
+        
+        return _run_single_quantile_experiment(
+            config, experiment_id, output_dir, device, 
+            verbose=verbose, parallel_mode=parallel_mode
+        )
+
+
+def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir: Path, device: str, verbose: bool = True, parallel_mode: bool = False):
+    """
+    Run a single experiment for one quantile (or mean regression)
+    This is the original run_single_experiment logic
+    """
+    # Check if results already exist (removed skip_existing logic, handled by parent)
     
     start_time = time.time()
     
@@ -1515,16 +1728,25 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     print("="*50)
     
     print("\nEvaluating on Train set...")
-    train_metrics = evaluate_model(model, train_loader, device)
-    print(f"Train - MSE: {train_metrics['mse']:.6f}, MAE: {train_metrics['mae']:.6f}, RMSE: {train_metrics['rmse']:.6f}")
+    train_metrics = evaluate_model(model, train_loader, device, config)
+    if config.get('regression_type') == 'quantile':
+        print(f"Train - Check Loss: {train_metrics.get('check_loss', train_metrics['mse']):.6f}, MAE: {train_metrics['mae']:.6f}")
+    else:
+        print(f"Train - MSE: {train_metrics['mse']:.6f}, MAE: {train_metrics['mae']:.6f}, RMSE: {train_metrics['rmse']:.6f}")
     
     print("\nEvaluating on Valid set...")
-    val_metrics = evaluate_model(model, val_loader, device)
-    print(f"Valid - MSE: {val_metrics['mse']:.6f}, MAE: {val_metrics['mae']:.6f}, RMSE: {val_metrics['rmse']:.6f}")
+    val_metrics = evaluate_model(model, val_loader, device, config)
+    if config.get('regression_type') == 'quantile':
+        print(f"Valid - Check Loss: {val_metrics.get('check_loss', val_metrics['mse']):.6f}, MAE: {val_metrics['mae']:.6f}")
+    else:
+        print(f"Valid - MSE: {val_metrics['mse']:.6f}, MAE: {val_metrics['mae']:.6f}, RMSE: {val_metrics['rmse']:.6f}")
     
     print("\nEvaluating on Test set...")
-    test_metrics = evaluate_model(model, test_loader, device)
-    print(f"Test  - MSE: {test_metrics['mse']:.6f}, MAE: {test_metrics['mae']:.6f}, RMSE: {test_metrics['rmse']:.6f}")
+    test_metrics = evaluate_model(model, test_loader, device, config)
+    if config.get('regression_type') == 'quantile':
+        print(f"Test  - Check Loss: {test_metrics.get('check_loss', test_metrics['mse']):.6f}, MAE: {test_metrics['mae']:.6f}")
+    else:
+        print(f"Test  - MSE: {test_metrics['mse']:.6f}, MAE: {test_metrics['mae']:.6f}, RMSE: {test_metrics['rmse']:.6f}")
     
     # Calculate total time
     total_time = time.time() - start_time
@@ -1573,6 +1795,11 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
                                  return_predictions=True, valid_mask=valid_mask, test_mask=test_mask)
     
     # Save predictions for later aggregation
+    test_predictions_array = None
+    valid_predictions_array = None
+    test_true_array = None
+    valid_true_array = None
+    
     if pred_data is not None:
         all_predictions, z_full_data, coords_data, train_mask_data, valid_mask_data, test_mask_data = pred_data
         np.savez(
@@ -1585,6 +1812,12 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
             test_mask=test_mask_data
         )
         print(f"Predictions saved to: {output_dir / 'predictions.npz'}")
+        
+        # Extract test and validation predictions for quantile regression
+        test_predictions_array = all_predictions[test_mask_data]
+        valid_predictions_array = all_predictions[valid_mask_data]
+        test_true_array = z_full_data[test_mask_data]
+        valid_true_array = z_full_data[valid_mask_data]
     
     # Save basis information (initial vs final)
     print("\n" + "="*50)
@@ -1628,6 +1861,18 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
         train_coords = np.array(train_coords_list)
     
     plot_basis_evolution(model_initial, model, train_coords, output_dir, config, basis_centers_history)
+    
+    # Add predictions to results for quantile regression
+    results['test_predictions'] = test_predictions_array
+    results['valid_predictions'] = valid_predictions_array
+    results['test_true'] = test_true_array
+    results['valid_true'] = valid_true_array
+    
+    # For quantile regression, use check loss instead of MSE in results
+    if config.get('regression_type') == 'quantile' and 'current_quantile' in config:
+        q = config['current_quantile']
+        results['test_mse'] = test_metrics.get('check_loss', test_metrics['mse'])
+        results['valid_mse'] = val_metrics.get('check_loss', val_metrics['mse'])
     
     print("\n" + "="*70)
     print(f"EXPERIMENT {experiment_id} COMPLETE!")

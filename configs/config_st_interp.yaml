@@ -23,10 +23,10 @@ domain_penalty_weight: 0.01            # Penalty weight for centers outside [0,1
 movement_penalty_weight: 0.0          # Penalty weight for centers moving from initial positions (set to 0 when using gradient_damping)
 
 # Sparsity penalty settings
-sparsity_penalty_type: sparse_group   # Sparsity penalty type: 'none', 'element', 'group', or 'sparse_group'
-sparsity_lambda_l1: 0.00001           # Element-wise L1 penalty weight (for 'element' or 'sparse_group') - creates exact zeros!
-sparsity_lambda_group: 0.00001        # Group Lasso penalty weight (for 'group' or 'sparse_group') - encourages group sparsity
-sparsity_apply_to_spatial: true       # Apply sparsity penalty to spatial basis connections
+sparsity_penalty_type: none   # Sparsity penalty type: 'none', 'element', 'group', or 'sparse_group'
+sparsity_lambda_l1: 0.0           # Element-wise L1 penalty weight (for 'element' or 'sparse_group') - creates exact zeros!
+sparsity_lambda_group: 0.0       # Group Lasso penalty weight (for 'group' or 'sparse_group') - encourages group sparsity
+sparsity_apply_to_spatial: false       # Apply sparsity penalty to spatial basis connections
 sparsity_apply_to_temporal: false     # Apply sparsity penalty to temporal basis connections
 sparsity_threshold_ratio: 0.01        # Threshold for "removed" basis = ratio × max_norm (1e-2 = 1% of max)
 
@@ -46,9 +46,9 @@ normalize_target: false           # Normalize target values
 
 # Training settings
 epochs: 500
-lr: 1e-2
-basis_lr_ratio: 0.05              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
-weight_decay: 5e-4
+lr: 5e-3
+basis_lr_ratio: 0.1              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
+weight_decay: 1e-3
 batch_size: 4096
 patience: 50
 grad_clip: 10.0                   # Gradient clipping
@@ -56,13 +56,17 @@ scheduler: cosine
 warmup_epochs: 10                 # Number of warmup epochs (increased for larger batch)
 
 # Progressive unfreezing settings (for spatial_learnable=true)
-basis_unfreeze_epoch: 50          # Epoch to unfreeze basis centers (0=train from start, >0=freeze then unfreeze)
+basis_unfreeze_epoch: 20          # Epoch to unfreeze basis centers (0=train from start, >0=freeze then unfreeze)
 basis_lr_rampup_epochs: 10        # Epochs to gradually ramp up basis lr after unfreezing (0=instant)
 
 # Experiment settings
-n_experiments: 20                 # Number of repeated experiments (M)
+n_experiments: 50                 # Number of repeated experiments (M)
 base_seed: 2025                   # Base seed (each experiment uses base_seed + i)
 num_workers: 0                    # DataLoader workers per experiment (set to 0 when using parallel grid search)
+
+# Regression type settings
+regression_type: mean             # Regression type: 'mean' or 'quantile'
+quantile_levels: [0.1, 0.5, 0.9]  # Quantile levels to estimate (only used when regression_type='quantile')
 
 # Device
 device: cpu

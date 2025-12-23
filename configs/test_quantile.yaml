@@ -1,0 +1,66 @@
+# Test configuration for quantile regression
+
+# Experiment tag
+tag: test_quantile
+
+# Data paths
+data_file: data/2a/2a_8.csv
+
+# Model architecture (small for testing)
+k_spatial_centers: [16]
+k_temporal_centers: [8]
+spatial_basis_function: wendland
+spatial_init_method: gmm
+spatial_learnable: false
+
+# Penalties and regularization
+gradient_damping: false
+domain_penalty_weight: 0.0
+movement_penalty_weight: 0.0
+sparsity_penalty_type: none
+sparsity_lambda_l1: 0.0
+sparsity_lambda_group: 0.0
+sparsity_apply_to_spatial: false
+sparsity_apply_to_temporal: false
+sparsity_threshold_ratio: 0.01
+
+hidden_dims: [128, 64]
+dropout: 0.1
+layernorm: true
+p_covariates: 0
+
+# Data settings
+obs_method: site-wise
+obs_ratio: 0.1
+obs_spatial_pattern: uniform
+obs_spatial_intensity: 1.0
+split_method: random
+train_ratio: 0.8
+normalize_target: false
+
+# Training settings (minimal for testing)
+epochs: 50
+lr: 5e-3
+basis_lr_ratio: 0.1
+weight_decay: 1e-3
+batch_size: 1024
+patience: 20
+grad_clip: 10.0
+scheduler: cosine
+warmup_epochs: 5
+
+# Progressive unfreezing
+basis_unfreeze_epoch: 0
+basis_lr_rampup_epochs: 0
+
+# Experiment settings
+n_experiments: 2  # Just 2 experiments for testing
+base_seed: 2025
+num_workers: 0
+
+# Regression type - QUANTILE MODE
+regression_type: quantile
+quantile_levels: [0.1, 0.5, 0.9]
+
+# Device
+device: cuda

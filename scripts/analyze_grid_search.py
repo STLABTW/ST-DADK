@@ -12,6 +12,318 @@ import numpy as np
 from pathlib import Path
 import argparse
 from itertools import product
+import json
+import yaml
+
+
+def regenerate_top_level_summaries(results_dir):
+    """
+    Regenerate top-level grid_search_summary.csv and grid_search_detail.csv
+    based on per-config summary files
+    
+    Args:
+        results_dir: Path to grid search results directory
+    """
+    results_path = Path(results_dir)
+    
+    # Find all config directories with summary files
+    config_yaml_paths = list(results_path.rglob('config.yaml'))
+    
+    if not config_yaml_paths:
+        print("❌ No config.yaml files found")
+        return
+    
+    # Get directories containing config.yaml and summary/
+    target_dirs = []
+    for config_path in config_yaml_paths:
+        config_dir = config_path.parent
+        summary_dir = config_dir / 'summary'
+        if summary_dir.exists() and (summary_dir / 'summary_statistics.json').exists():
+            target_dirs.append(config_dir)
+    
+    target_dirs = sorted(target_dirs)
+    
+    if not target_dirs:
+        print("❌ No valid config directories with summary files found")
+        return
+    
+    print(f"Regenerating top-level summaries from {len(target_dirs)} configs...")
+    
+    # Collect all results
+    all_configs = []
+    summary_records = []
+    detail_records = []
+    
+    for config_dir in target_dirs:
+        # Load config
+        with open(config_dir / 'config.yaml', 'r') as f:
+            import yaml
+            config = yaml.safe_load(f)
+        
+        # Load summary statistics
+        summary_file = config_dir / 'summary' / 'summary_statistics.json'
+        with open(summary_file, 'r') as f:
+            summary = json.load(f)
+        
+        all_configs.append(config)
+        
+        # Build summary record
+        record = {
+            'config_id': config.get('config_id', 0),
+            'tag': config.get('tag', ''),
+            'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),
+            'spatial_init_method': config.get('spatial_init_method', ''),
+            'spatial_learnable': config.get('spatial_learnable', False),
+            'obs_method': config.get('obs_method', ''),
+            'obs_ratio': config.get('obs_ratio', 0.0),
+            'obs_spatial_pattern': config.get('obs_spatial_pattern', ''),
+            'n_experiments': summary.get('n_experiments', 0),
+        }
+        
+        # Add metric statistics - check if they're nested under 'statistics'
+        stats_dict = summary.get('statistics', summary)  # Try 'statistics' key first, fallback to root
+        
+        for metric in ['test_rmse', 'test_mae', 'test_mse', 
+                       'valid_rmse', 'valid_mae', 'valid_mse',
+                       'train_rmse', 'train_mae', 'train_mse',
+                       'total_time_seconds']:
+            if metric in stats_dict:
+                stats = stats_dict[metric]
+                record[f'{metric}_mean'] = stats['mean']
+                record[f'{metric}_std'] = stats['std']
+                record[f'{metric}_min'] = stats['min']
+                record[f'{metric}_max'] = stats['max']
+                record[f'{metric}_median'] = stats['median']
+        
+        summary_records.append(record)
+        
+        # Load detailed results for grid_search_detail.csv
+        all_exp_file = config_dir / 'summary' / 'all_experiments.csv'
+        if all_exp_file.exists():
+            df_exp = pd.read_csv(all_exp_file)
+            for _, row in df_exp.iterrows():
+                detail_record = {
+                    'config_id': config.get('config_id', 0),
+                    'tag': config.get('tag', ''),
+                    'experiment_id': row['experiment_id'],
+                    'spatial_basis_function': config.get('spatial_basis_function', 'wendland'),
+                    'spatial_init_method': config.get('spatial_init_method', ''),
+                    'spatial_learnable': config.get('spatial_learnable', False),
+                    'obs_method': config.get('obs_method', ''),
+                    'obs_ratio': config.get('obs_ratio', 0.0),
+                    'obs_spatial_pattern': config.get('obs_spatial_pattern', ''),
+                }
+                
+                # Add metrics
+                for metric in ['test_rmse', 'test_mae', 'test_mse',
+                               'valid_rmse', 'valid_mae', 'valid_mse',
+                               'train_rmse', 'train_mae', 'train_mse',
+                               'total_time_seconds']:
+                    if metric in row:
+                        detail_record[metric] = row[metric]
+                
+                detail_records.append(detail_record)
+    
+    # Save grid_search_summary.csv
+    df_summary = pd.DataFrame(summary_records)
+    df_summary = df_summary.sort_values('config_id')
+    summary_file = results_path / 'grid_search_summary.csv'
+    df_summary.to_csv(summary_file, index=False)
+    print(f"✓ Updated: grid_search_summary.csv ({len(df_summary)} configs)")
+    
+    # Save grid_search_detail.csv
+    df_detail = pd.DataFrame(detail_records)
+    df_detail = df_detail.sort_values(['config_id', 'experiment_id'])
+    detail_file = results_path / 'grid_search_detail.csv'
+    df_detail.to_csv(detail_file, index=False)
+    print(f"✓ Updated: grid_search_detail.csv ({len(df_detail)} experiments)")
+    
+    # Save grid_search_configs.json
+    configs_dict = {str(cfg.get('config_id', 0)): cfg for cfg in all_configs}
+    config_json_file = results_path / 'grid_search_configs.json'
+    with open(config_json_file, 'w', encoding='utf-8') as f:
+        json.dump(configs_dict, f, indent=2, ensure_ascii=False)
+    print(f"✓ Updated: grid_search_configs.json ({len(configs_dict)} configs)")
+    
+    # Save grid_search_configs.csv (simple index)
+    config_records = [{'config_id': cfg.get('config_id', 0), 'tag': cfg.get('tag', '')} 
+                      for cfg in all_configs]
+    df_configs = pd.DataFrame(config_records)
+    df_configs = df_configs.sort_values('config_id')
+    config_file = results_path / 'grid_search_configs.csv'
+    df_configs.to_csv(config_file, index=False)
+    print(f"✓ Updated: grid_search_configs.csv ({len(df_configs)} configs)\n")
+
+
+def regenerate_config_summaries(results_dir):
+    """
+    Regenerate summary files for each config based on existing results.json files
+    
+    Args:
+        results_dir: Path to grid search results directory
+    """
+    results_path = Path(results_dir)
+    
+    # Find all directories with config.yaml (may be nested)
+    config_yaml_paths = list(results_path.rglob('config.yaml'))
+    
+    if not config_yaml_paths:
+        print("❌ No config.yaml files found")
+        return
+    
+    # Get directories containing config.yaml and experiments/
+    target_dirs = []
+    for config_path in config_yaml_paths:
+        config_dir = config_path.parent
+        experiments_dir = config_dir / 'experiments'
+        if experiments_dir.exists():
+            target_dirs.append(config_dir)
+    
+    target_dirs = sorted(target_dirs)
+    
+    if not target_dirs:
+        print("❌ No valid config directories with experiments/ found")
+        return
+    
+    print(f"Found {len(target_dirs)} config directories with experiments\n")
+    
+    success_count = 0
+    failed_count = 0
+    
+    for config_dir in target_dirs:
+        # Get relative path for display
+        rel_path = config_dir.relative_to(results_path)
+        print(f"Processing {rel_path}...", end=' ')
+        
+        try:
+            experiments_dir = config_dir / 'experiments'
+            
+            # Collect all results from individual experiment directories
+            all_results = []
+            
+            exp_subdirs = sorted([d for d in experiments_dir.iterdir() if d.is_dir()])
+            
+            for exp_subdir in exp_subdirs:
+                result_file = exp_subdir / 'results.json'
+                if result_file.exists():
+                    with open(result_file, 'r') as f:
+                        result = json.load(f)
+                        all_results.append(result)
+            
+            if not all_results:
+                print("❌ No results.json files found")
+                failed_count += 1
+                continue
+            
+            # Create summary directory
+            summary_dir = config_dir / 'summary'
+            summary_dir.mkdir(exist_ok=True)
+            
+            # Generate summary statistics
+            n_experiments = len(all_results)
+            
+            # Extract metrics from all experiments
+            metrics_data = {
+                'train_mse': [],
+                'train_mae': [],
+                'train_rmse': [],
+                'valid_mse': [],
+                'valid_mae': [],
+                'valid_rmse': [],
+                'test_mse': [],
+                'test_mae': [],
+                'test_rmse': [],
+                'total_time_seconds': []
+            }
+            
+            exp_records = []
+            
+            for result in all_results:
+                # Handle both old and new format
+                if 'metrics' in result:
+                    train_metrics = result['metrics']['train']
+                    valid_metrics = result['metrics']['valid']
+                    test_metrics = result['metrics']['test']
+                else:
+                    # Old format with direct keys
+                    train_metrics = {'mse': result.get('train_mse', 0), 
+                                   'mae': result.get('train_mae', 0),
+                                   'rmse': result.get('train_rmse', 0)}
+                    valid_metrics = {'mse': result.get('valid_mse', 0),
+                                   'mae': result.get('valid_mae', 0),
+                                   'rmse': result.get('valid_rmse', 0)}
+                    test_metrics = {'mse': result.get('test_mse', 0),
+                                  'mae': result.get('test_mae', 0),
+                                  'rmse': result.get('test_rmse', 0)}
+                
+                metrics_data['train_mse'].append(train_metrics['mse'])
+                metrics_data['train_mae'].append(train_metrics['mae'])
+                metrics_data['train_rmse'].append(train_metrics['rmse'])
+                metrics_data['valid_mse'].append(valid_metrics['mse'])
+                metrics_data['valid_mae'].append(valid_metrics['mae'])
+                metrics_data['valid_rmse'].append(valid_metrics['rmse'])
+                metrics_data['test_mse'].append(test_metrics['mse'])
+                metrics_data['test_mae'].append(test_metrics['mae'])
+                metrics_data['test_rmse'].append(test_metrics['rmse'])
+                metrics_data['total_time_seconds'].append(result.get('total_time_seconds', 0))
+                
+                # Record for CSV
+                exp_records.append({
+                    'experiment_id': result.get('experiment_id', 0),
+                    'experiment_seed': result.get('experiment_seed', 0),
+                    'train_mse': train_metrics['mse'],
+                    'train_mae': train_metrics['mae'],
+                    'train_rmse': train_metrics['rmse'],
+                    'valid_mse': valid_metrics['mse'],
+                    'valid_mae': valid_metrics['mae'],
+                    'valid_rmse': valid_metrics['rmse'],
+                    'test_mse': test_metrics['mse'],
+                    'test_mae': test_metrics['mae'],
+                    'test_rmse': test_metrics['rmse'],
+                    'total_time_seconds': result.get('total_time_seconds', 0)
+                })
+            
+            # Compute statistics
+            summary = {
+                'n_experiments': n_experiments,
+                'statistics': {}
+            }
+            
+            for metric_name, values in metrics_data.items():
+                values_array = np.array(values)
+                summary['statistics'][metric_name] = {
+                    'mean': float(np.mean(values_array)),
+                    'std': float(np.std(values_array)),
+                    'min': float(np.min(values_array)),
+                    'max': float(np.max(values_array)),
+                    'median': float(np.median(values_array)),
+                    'values': [float(v) for v in values]
+                }
+            
+            # Save summary JSON
+            summary_file = summary_dir / 'summary_statistics.json'
+            with open(summary_file, 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            # Save detailed CSV
+            df = pd.DataFrame(exp_records)
+            csv_file = summary_dir / 'all_experiments.csv'
+            df.to_csv(csv_file, index=False)
+            
+            print(f"✓ ({n_experiments} experiments)")
+            success_count += 1
+            
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            failed_count += 1
+            import traceback
+            traceback.print_exc()
+    
+    print(f"\n{'='*80}")
+    print(f"Summary regeneration complete:")
+    print(f"  ✓ Success: {success_count}")
+    print(f"  ✗ Failed: {failed_count}")
+    print(f"{'='*80}")
 
 
 def get_latest_grid_search_dir():
@@ -124,6 +436,8 @@ def main():
     parser.add_argument('grid_dir', type=str, nargs='?', 
                         default=None,
                         help='Grid search directory path (default: latest)')
+    parser.add_argument('--summarize-only', action='store_true',
+                        help='Only regenerate per-config summaries without re-running analysis')
     args = parser.parse_args()
     
     # Determine grid directory
@@ -142,14 +456,43 @@ def main():
         print(f"❌ Grid directory not found: {results_dir}")
         exit(1)
     
+    # ========================================================================
+    # Regenerate per-config summaries (always do this first)
+    # ========================================================================
+    print(f"\n{'='*80}")
+    print(f"STEP 1: REGENERATING PER-CONFIG SUMMARIES")
+    print(f"{'='*80}\n")
+    
+    regenerate_config_summaries(results_dir)
+    
+    # ========================================================================
+    # Regenerate top-level summary files (grid_search_summary.csv, etc.)
+    # ========================================================================
+    print(f"\n{'='*80}")
+    print(f"STEP 2: REGENERATING TOP-LEVEL SUMMARIES")
+    print(f"{'='*80}\n")
+    
+    regenerate_top_level_summaries(results_dir)
+    
+    if args.summarize_only:
+        print(f"\n{'='*80}")
+        print("✅ SUMMARY REGENERATION COMPLETE!")
+        print(f"{'='*80}\n")
+        return
+    
+    # ========================================================================
+    # Generate analysis plots
+    # ========================================================================
+    print(f"\n{'='*80}")
+    print(f"STEP 3: GENERATING ANALYSIS PLOTS")
+    print(f"{'='*80}\n")
+    
     detail_csv = results_dir / 'grid_search_detail.csv'
     if not detail_csv.exists():
         print(f"❌ grid_search_detail.csv not found in {results_dir}")
         exit(1)
     
-    print(f"\n{'='*80}")
-    print(f"Analyzing: {results_dir}")
-    print(f"{'='*80}\n")
+    print(f"Analyzing: {results_dir}\n")
     
     df_detail = pd.read_csv(detail_csv)
     
