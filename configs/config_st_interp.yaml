@@ -1,7 +1,7 @@
 # Spatio-Temporal Interpolation Model Configuration
 
-# Experiment tag (used in output directory name)
-tag: integrated
+# Experiment tag
+tag: test_quantile
 
 # Data paths
 data_file: data/2a/2a_8.csv  # Full data file
@@ -45,7 +45,7 @@ train_ratio: 0.8                  # Train/valid split ratio
 normalize_target: false           # Normalize target values
 
 # Training settings
-epochs: 500
+epochs: 1
 lr: 1e-2
 basis_lr_ratio: 0.05              # Basis learning rate = lr × basis_lr_ratio (default: 5% of MLP lr)
 weight_decay: 5e-4
@@ -60,9 +60,13 @@ basis_unfreeze_epoch: 50          # Epoch to unfreeze basis centers (0=train fro
 basis_lr_rampup_epochs: 10        # Epochs to gradually ramp up basis lr after unfreezing (0=instant)
 
 # Experiment settings
-n_experiments: 20                 # Number of repeated experiments (M)
+n_experiments: 1                 # Number of repeated experiments (M)
 base_seed: 2025                   # Base seed (each experiment uses base_seed + i)
 num_workers: 0                    # DataLoader workers per experiment (set to 0 when using parallel grid search)
+
+# Regression type
+regression_type: means
+quantile_levels: [0.1, 0.5, 0.9]
 
 # Device
 device: cpu
