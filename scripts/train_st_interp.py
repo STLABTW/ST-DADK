@@ -97,6 +97,30 @@ def compute_crps(predictions_dict, y_true):
     return crps_simple / len(quantiles)
 
 
+def compute_crps_multi_quantile(preds, y_true, quantile_levels):
+    """
+    Compute CRPS for multi-quantile model output
+    
+    Args:
+        preds: predictions array (N, Q) where Q is number of quantiles
+        y_true: true values (N,) or (N, 1)
+        quantile_levels: list of quantile levels [q1, q2, ..., qQ]
+    
+    Returns:
+        CRPS score (lower is better)
+    """
+    # Ensure y_true is 1D
+    if y_true.ndim > 1:
+        y_true = y_true.flatten()
+    
+    # Convert to dict format for compute_crps
+    predictions_dict = {}
+    for i, q in enumerate(quantile_levels):
+        predictions_dict[q] = preds[:, i]
+    
+    return compute_crps(predictions_dict, y_true)
+
+
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
     """
     Create spatial observation probability function
@@ -392,6 +416,7 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     # Loss function based on regression type
     regression_type = config.get('regression_type', 'mean')
     current_quantile = config.get('current_quantile', None)  # Single quantile for this run
+    quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])  # For multi-quantile
     
     if regression_type == 'mean':
         criterion = nn.MSELoss()
@@ -400,6 +425,9 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         if current_quantile is None:
             raise ValueError("current_quantile must be specified for quantile regression")
         print(f"Loss function: Quantile loss (quantile={current_quantile})")
+    elif regression_type == 'multi-quantile':
+        print(f"Loss function: Multi-quantile loss (quantiles={quantile_levels})")
+        quantile_levels_tensor = torch.tensor(quantile_levels, device=device).float()
     else:
         raise ValueError(f"Unknown regression_type: {regression_type}")
     
@@ -466,6 +494,14 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 loss = criterion(y_pred, y)
             elif regression_type == 'quantile':
                 loss = quantile_loss(y_pred, y, current_quantile)
+            elif regression_type == 'multi-quantile':
+                # y_pred: (B, Q), y: (B, 1)
+                # Compute mean quantile loss across all quantiles
+                losses = []
+                for q_idx, q_level in enumerate(quantile_levels):
+                    q_pred = y_pred[:, q_idx:q_idx+1]
+                    losses.append(quantile_loss(q_pred, y, q_level))
+                loss = torch.mean(torch.stack(losses))
             
             # Add regularization penalties for learnable basis centers
             if config.get('spatial_learnable', False):
@@ -566,6 +602,13 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     loss = criterion(y_pred, y)
                 elif regression_type == 'quantile':
                     loss = quantile_loss(y_pred, y, current_quantile)
+                elif regression_type == 'multi-quantile':
+                    # Use mean quantile loss for validation
+                    losses = []
+                    for q_idx, q_level in enumerate(quantile_levels):
+                        q_pred = y_pred[:, q_idx:q_idx+1]
+                        losses.append(quantile_loss(q_pred, y, q_level))
+                    loss = torch.mean(torch.stack(losses))
                 
                 val_loss += loss.item()
                 
@@ -579,7 +622,16 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         # Compute RMSE
         val_preds = np.concatenate(val_preds, axis=0)
         val_trues = np.concatenate(val_trues, axis=0)
-        val_rmse = np.sqrt(np.mean((val_preds - val_trues) ** 2))
+        
+        # For multi-quantile, use median quantile (typically 0.5) for RMSE
+        if regression_type == 'multi-quantile':
+            # Find median quantile index
+            median_idx = len(quantile_levels) // 2
+            val_preds_for_rmse = val_preds[:, median_idx:median_idx+1]
+        else:
+            val_preds_for_rmse = val_preds
+        
+        val_rmse = np.sqrt(np.mean((val_preds_for_rmse - val_trues) ** 2))
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -662,7 +714,7 @@ def evaluate_model(model, data_loader, device, config=None):
     Evaluate model on a dataset
     
     Returns:
-        metrics: dict with 'mse', 'mae', and optionally 'check_loss'
+        metrics: dict with 'mse', 'mae', 'rmse', and optionally 'check_loss', 'crps' for quantile/multi-quantile
     """
     model.eval()
     all_preds = []
@@ -680,11 +732,21 @@ def evaluate_model(model, data_loader, device, config=None):
             all_preds.append(y_pred.cpu().numpy())
             all_trues.append(y.cpu().numpy())
     
-    preds = np.concatenate(all_preds, axis=0)
-    trues = np.concatenate(all_trues, axis=0)
+    preds = np.concatenate(all_preds, axis=0)  # (N, 1) or (N, Q)
+    trues = np.concatenate(all_trues, axis=0)  # (N, 1)
     
-    mse = np.mean((preds - trues) ** 2)
-    mae = np.mean(np.abs(preds - trues))
+    regression_type = config.get('regression_type', 'mean') if config is not None else 'mean'
+    
+    # For multi-quantile, use median quantile for MSE/MAE/RMSE
+    if regression_type == 'multi-quantile':
+        quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        median_idx = len(quantile_levels) // 2
+        preds_for_metrics = preds[:, median_idx:median_idx+1]
+    else:
+        preds_for_metrics = preds
+    
+    mse = np.mean((preds_for_metrics - trues) ** 2)
+    mae = np.mean(np.abs(preds_for_metrics - trues))
     
     metrics = {
         'mse': float(mse),
@@ -701,6 +763,28 @@ def evaluate_model(model, data_loader, device, config=None):
             q
         ).item()
         metrics['check_loss'] = float(check_loss)
+    
+    # Add CRPS and mean check loss for multi-quantile regression
+    if config is not None and config.get('regression_type') == 'multi-quantile':
+        quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        
+        # Compute CRPS using the new multi-quantile function
+        crps = compute_crps_multi_quantile(preds, trues, quantile_levels)
+        metrics['crps'] = float(crps)
+        
+        # Compute mean check loss across all quantiles
+        check_losses = []
+        for q_idx, q_level in enumerate(quantile_levels):
+            q_pred = preds[:, q_idx:q_idx+1]
+            check_loss_q = quantile_loss(
+                torch.tensor(q_pred, dtype=torch.float32),
+                torch.tensor(trues, dtype=torch.float32),
+                q_level
+            ).item()
+            check_losses.append(check_loss_q)
+        
+        metrics['mean_check_loss'] = float(np.mean(check_losses))
+        metrics['check_loss'] = float(np.mean(check_losses))  # Alias for compatibility
     
     return metrics
 
@@ -836,7 +920,15 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
             coords_tensor = torch.from_numpy(coords).float().to(device)
             X_tensor = torch.zeros(S, 0).to(device)  # No covariates
             
-            y_pred = model(X_tensor, coords_tensor, t_tensor).cpu().numpy().flatten()
+            y_pred = model(X_tensor, coords_tensor, t_tensor).cpu().numpy()  # (S, output_dim)
+            
+            # For multi-quantile, use median quantile; otherwise use single output
+            if y_pred.shape[1] > 1:  # Multi-quantile
+                median_idx = y_pred.shape[1] // 2
+                y_pred = y_pred[:, median_idx]
+            else:
+                y_pred = y_pred.flatten()
+            
             predictions[t_idx] = y_pred
     
     # Create grid for interpolation (higher resolution for smoother heatmap)
@@ -966,7 +1058,15 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir,
             coords_tensor = torch.from_numpy(coords).float().to(device)
             X_tensor = torch.zeros(S, 0).to(device)  # No covariates
             
-            y_pred = model(X_tensor, coords_tensor, t_tensor).cpu().numpy().flatten()
+            y_pred = model(X_tensor, coords_tensor, t_tensor).cpu().numpy()  # (S, output_dim)
+            
+            # For multi-quantile, use median quantile; otherwise use single output
+            if y_pred.shape[1] > 1:  # Multi-quantile
+                median_idx = y_pred.shape[1] // 2
+                y_pred = y_pred[:, median_idx]
+            else:
+                y_pred = y_pred.flatten()
+            
             all_predictions[t_idx, :] = y_pred
     
     # Compute MSE per site (averaged over time)
@@ -1017,6 +1117,261 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir,
     if return_predictions:
         return all_predictions, z_full, coords, train_mask, valid_mask, test_mask
     return None
+
+
+def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir, 
+                         valid_mask=None, test_mask=None, n_sites=4, quantile_models=None, quantile_levels=None):
+    """
+    Plot temporal series for selected spatial locations
+    
+    Args:
+        model: trained model (for mean regression or single quantile), can be None if only quantile_models provided
+        z_full: (T, S) full data
+        coords: (S, 2) coordinates
+        train_mask: (T, S) training mask
+        device: computation device
+        output_dir: output directory
+        valid_mask: (T, S) validation mask (optional)
+        test_mask: (T, S) test mask (optional)
+        n_sites: number of sites to plot
+        quantile_models: dict of {quantile_level: model} for quantile regression (optional)
+        quantile_levels: list of quantile levels (optional)
+    """
+    matplotlib.use('Agg')
+    
+    T, S = z_full.shape
+    
+    if valid_mask is None:
+        valid_mask = np.zeros_like(train_mask, dtype=bool)
+    if test_mask is None:
+        test_mask = ~(train_mask | valid_mask)
+    
+    # Select sites with good spatial coverage
+    # Choose sites from different regions
+    coords_np = coords.cpu().numpy() if torch.is_tensor(coords) else coords
+    
+    # First, ensure at least one site with training samples
+    sites_with_train = np.where(train_mask.sum(axis=0) > 0)[0]
+    selected_sites = []
+    
+    if len(sites_with_train) > 0:
+        # Pick a train site near the center
+        center = np.array([0.5, 0.5])
+        dists_to_center = np.linalg.norm(coords_np[sites_with_train] - center, axis=1)
+        train_site = sites_with_train[np.argmin(dists_to_center)]
+        selected_sites.append(train_site)
+    
+    # Then select remaining sites with spatial coverage
+    n_grid = int(np.ceil(np.sqrt(n_sites)))
+    
+    for i in range(n_grid):
+        for j in range(n_grid):
+            if len(selected_sites) >= n_sites:
+                break
+            
+            # Define region boundaries
+            x_min, x_max = i / n_grid, (i + 1) / n_grid
+            y_min, y_max = j / n_grid, (j + 1) / n_grid
+            
+            # Find sites in this region
+            in_region = (
+                (coords_np[:, 0] >= x_min) & (coords_np[:, 0] < x_max) &
+                (coords_np[:, 1] >= y_min) & (coords_np[:, 1] < y_max)
+            )
+            
+            if in_region.sum() > 0:
+                # Pick site closest to region center
+                region_center = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2])
+                dists = np.linalg.norm(coords_np[in_region] - region_center, axis=1)
+                local_idx = np.argmin(dists)
+                global_idx = np.where(in_region)[0][local_idx]
+                if global_idx not in selected_sites:
+                    selected_sites.append(global_idx)
+    
+    # Get predictions
+    all_predictions = None
+    quantile_predictions = {}  # Initialize for multi-quantile or separate quantile models
+    
+    if model is not None:
+        model.eval()
+        with torch.no_grad():
+            # Create meshgrid for all (t, s) pairs
+            t_grid = torch.linspace(0, 1, T, device=device)
+            coords_tensor = torch.tensor(coords_np, dtype=torch.float32, device=device)
+            
+            # Expand to (T*S, 1) and (T*S, 2)
+            t_expanded = t_grid.repeat_interleave(S).unsqueeze(1)  # (T*S, 1)
+            coords_expanded = coords_tensor.repeat(T, 1)  # (T*S, 2)
+            
+            # Create empty covariate tensor if p_covariates == 0
+            if hasattr(model, 'p') and model.p > 0:
+                X_expanded = torch.zeros(T * S, model.p, device=device)
+            else:
+                X_expanded = torch.zeros(T * S, 0, device=device)
+            
+            # Get predictions for mean or single quantile or multi-quantile
+            all_predictions_raw = model(X_expanded, coords_expanded, t_expanded)  # (T*S, output_dim)
+            
+            # For multi-quantile model (output_dim > 1), also extract individual quantile predictions
+            if all_predictions_raw.shape[1] > 1 and quantile_levels is not None:
+                # Multi-quantile model: extract each quantile
+                for q_idx, q_level in enumerate(quantile_levels):
+                    q_pred_flat = all_predictions_raw[:, q_idx]
+                    quantile_predictions[q_level] = q_pred_flat.reshape(T, S).cpu().numpy()
+                
+                # Use median quantile for basic plot
+                median_idx = all_predictions_raw.shape[1] // 2
+                all_predictions_flat = all_predictions_raw[:, median_idx]
+            else:
+                all_predictions_flat = all_predictions_raw.squeeze()
+            
+            all_predictions = all_predictions_flat.reshape(T, S).cpu().numpy()  # (T, S)
+    
+    # Get quantile predictions from separate models if available
+    if quantile_models is not None and quantile_levels is not None:
+        # Create meshgrid for quantile predictions
+        t_grid = torch.linspace(0, 1, T, device=device)
+        coords_tensor = torch.tensor(coords_np, dtype=torch.float32, device=device)
+        t_expanded = t_grid.repeat_interleave(S).unsqueeze(1)
+        coords_expanded = coords_tensor.repeat(T, 1)
+        
+        for q_level, q_model in quantile_models.items():
+            q_model.eval()
+            with torch.no_grad():
+                # Create empty covariate tensor for each quantile model
+                if hasattr(q_model, 'p_covariates') and q_model.p_covariates > 0:
+                    X_q = torch.zeros(T * S, q_model.p_covariates, device=device)
+                else:
+                    X_q = torch.zeros(T * S, 0, device=device)
+                q_predictions_flat = q_model(X_q, coords_expanded, t_expanded).squeeze()  # (T*S,)
+                quantile_predictions[q_level] = q_predictions_flat.reshape(T, S).cpu().numpy()  # (T, S)
+    
+    # Only create basic plot if model is provided
+    if model is not None and all_predictions is not None:
+        # Create subplots: 4 rows x 1 column for wide horizontal plots
+        n_rows = len(selected_sites)
+        n_cols = 1
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3.5 * n_rows))
+        if len(selected_sites) == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        time_points = np.arange(1, T + 1)  # Original time scale: 1, 2, ..., T
+        
+        for idx, site_idx in enumerate(selected_sites):
+            ax = axes[idx]
+            
+            # Get data for this site
+            true_values = z_full[:, site_idx]
+            pred_values = all_predictions[:, site_idx]
+            
+            train_obs = train_mask[:, site_idx]
+            valid_obs = valid_mask[:, site_idx]
+            test_obs = test_mask[:, site_idx]
+            
+            # Plot predictions (line)
+            ax.plot(time_points, pred_values, 'b-', linewidth=2, label='Prediction', alpha=0.8)
+            
+            # Plot observed data (all circles) - Test: gray, Train+Valid: black
+            if test_obs.sum() > 0:
+                ax.scatter(time_points[test_obs], true_values[test_obs], 
+                          c='gray', s=40, marker='o', alpha=0.7, label='Test (unobserved)', zorder=3)
+            # Combine train and valid as "observed" in black
+            observed_mask = train_obs | valid_obs
+            if observed_mask.sum() > 0:
+                ax.scatter(time_points[observed_mask], true_values[observed_mask], 
+                          c='black', s=40, marker='o', alpha=0.7, label='Train (observed)', zorder=3)
+            
+            site_coord = coords_np[site_idx]
+            ax.set_title(f'Site {site_idx} at ({site_coord[0]:.3f}, {site_coord[1]:.3f})', 
+                        fontsize=12, fontweight='bold')
+            ax.set_xlabel('Time', fontsize=10)
+            ax.set_ylabel('Value', fontsize=10)
+            ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for idx in range(len(selected_sites), len(axes)):
+            axes[idx].axis('off')
+        
+        plt.tight_layout(rect=[0, 0, 0.85, 1])  # Leave space for legend on the right
+        save_path = output_dir / 'temporal_series.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Temporal series plot saved to {save_path}")
+    
+    # If quantile regression, create combined quantile plot ONLY
+    if quantile_predictions and quantile_levels:
+        # Create subplots: 4 rows x 1 column for wide horizontal plots
+        n_rows = len(selected_sites)
+        n_cols = 1
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3.5 * n_rows))
+        if len(selected_sites) == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        # Use vivid rainbow colors for quantiles (more saturated and visible)
+        if len(quantile_levels) == 3:
+            # For 3 quantiles: blue, green, red
+            colors = ['#0000FF', '#00CC00', '#FF0000']  # Vivid blue, green, red
+        elif len(quantile_levels) == 5:
+            # For 5 quantiles: blue, cyan, green, orange, red
+            colors = ['#0000FF', '#00CCCC', '#00CC00', '#FF8800', '#FF0000']
+        elif len(quantile_levels) == 7:
+            # For 7 quantiles: full rainbow
+            colors = ['#8B00FF', '#0000FF', '#00CCCC', '#00CC00', '#FFCC00', '#FF8800', '#FF0000']
+        else:
+            # General case: use tab10 colormap (more distinct colors)
+            colors = plt.cm.tab10(np.linspace(0, 0.9, len(quantile_levels)))
+        
+        time_points = np.arange(1, T + 1)  # Original time scale: 1, 2, ..., T
+        
+        for idx, site_idx in enumerate(selected_sites):
+            ax = axes[idx]
+            
+            true_values = z_full[:, site_idx]
+            train_obs = train_mask[:, site_idx]
+            valid_obs = valid_mask[:, site_idx]
+            test_obs = test_mask[:, site_idx]
+            
+            # Plot each quantile with rainbow colors
+            for q_idx, q_level in enumerate(quantile_levels):
+                pred_values = quantile_predictions[q_level][:, site_idx]
+                ax.plot(time_points, pred_values, 
+                       color=colors[q_idx], linewidth=2, 
+                       label=f'τ={q_level}', alpha=0.8)
+            
+            # Plot observed data (all circles) - Test: gray, Train+Valid: black
+            if test_obs.sum() > 0:
+                ax.scatter(time_points[test_obs], true_values[test_obs], 
+                          c='gray', s=40, marker='o', alpha=0.7, 
+                          label='Test', zorder=3)
+            # Combine train and valid as "observed" in black
+            observed_mask = train_obs | valid_obs
+            if observed_mask.sum() > 0:
+                ax.scatter(time_points[observed_mask], true_values[observed_mask], 
+                          c='black', s=40, marker='o', alpha=0.7, 
+                          label='Train', zorder=3)
+            
+            site_coord = coords_np[site_idx]
+            ax.set_title(f'Site {site_idx} at ({site_coord[0]:.3f}, {site_coord[1]:.3f}) - All Quantiles', 
+                        fontsize=12, fontweight='bold')
+            ax.set_xlabel('Time', fontsize=10)
+            ax.set_ylabel('Value', fontsize=10)
+            ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for idx in range(len(selected_sites), len(axes)):
+            axes[idx].axis('off')
+        
+        plt.tight_layout(rect=[0, 0, 0.85, 1])  # Leave space for legend on the right
+        save_path = output_dir / 'temporal_series_quantiles_combined.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Combined quantile temporal series plot saved to {save_path}")
 
 
 def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_dir):
@@ -1402,7 +1757,24 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
     regression_type = config.get('regression_type', 'mean')
     quantile_levels = config.get('quantile_levels', [0.5])
     
-    if regression_type == 'quantile' and len(quantile_levels) > 1:
+    # For multi-quantile, train a single model
+    if regression_type == 'multi-quantile':
+        if verbose:
+            print("\n" + "="*70)
+            print(f"MULTI-QUANTILE REGRESSION: Training single model for {len(quantile_levels)} quantiles")
+            print(f"Quantiles: {quantile_levels}")
+            print("="*70)
+        
+        # Run single experiment with multi-quantile model
+        result = _run_single_quantile_experiment(
+            config, experiment_id, output_dir, device, 
+            verbose=verbose, parallel_mode=parallel_mode
+        )
+        
+        return result
+    
+    # For single-quantile regression, train separate models per quantile
+    elif regression_type == 'quantile' and len(quantile_levels) > 1:
         # Run separate experiment for each quantile level
         if verbose:
             print("\n" + "="*70)
@@ -1455,6 +1827,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
             
             quantile_results[q_level] = q_result
             quantile_predictions[q_level] = {
+                'train': q_result.get('train_predictions'),
                 'test': q_result.get('test_predictions'),
                 'valid': q_result.get('valid_predictions')
             }
@@ -1466,22 +1839,31 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
             print(f"{'='*70}")
         
         # Aggregate results
+        train_true = quantile_results[quantile_levels[0]].get('train_true')
         test_true = quantile_results[quantile_levels[0]].get('test_true')
         valid_true = quantile_results[quantile_levels[0]].get('valid_true')
         
+        train_preds_dict = {q: quantile_predictions[q]['train'] for q in quantile_levels}
         test_preds_dict = {q: quantile_predictions[q]['test'] for q in quantile_levels}
         valid_preds_dict = {q: quantile_predictions[q]['valid'] for q in quantile_levels}
         
+        train_crps = compute_crps(train_preds_dict, train_true)
         test_crps = compute_crps(test_preds_dict, test_true)
         valid_crps = compute_crps(valid_preds_dict, valid_true)
         
-        # Average check loss across quantiles
-        test_check_loss = np.mean([quantile_results[q]['test_mse'] for q in quantile_levels])
-        valid_check_loss = np.mean([quantile_results[q]['valid_mse'] for q in quantile_levels])
+        # Average check loss across quantiles (use check_loss from each quantile result)
+        test_check_loss = np.mean([quantile_results[q].get('test_check_loss', quantile_results[q].get('test_mse')) for q in quantile_levels])
+        valid_check_loss = np.mean([quantile_results[q].get('valid_check_loss', quantile_results[q].get('valid_mse')) for q in quantile_levels])
+        train_check_loss = np.mean([quantile_results[q].get('train_check_loss', quantile_results[q].get('train_mse')) for q in quantile_levels])
+        
+        # Also compute average time
+        total_time = np.sum([quantile_results[q].get('total_time_seconds', 0) for q in quantile_levels])
         
         if verbose:
-            print(f"\nTest  CRPS: {test_crps:.6f}")
+            print(f"\nTrain CRPS: {train_crps:.6f}")
+            print(f"Test  CRPS: {test_crps:.6f}")
             print(f"Valid CRPS: {valid_crps:.6f}")
+            print(f"Train Check Loss (avg): {train_check_loss:.6f}")
             print(f"Test  Check Loss (avg): {test_check_loss:.6f}")
             print(f"Valid Check Loss (avg): {valid_check_loss:.6f}")
         
@@ -1491,18 +1873,84 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
             'regression_type': 'quantile',
             'quantile_levels': quantile_levels,
             'quantile_results': quantile_results,
+            'train_crps': float(train_crps),
             'test_crps': float(test_crps),
             'valid_crps': float(valid_crps),
+            'train_check_loss': float(train_check_loss),
             'test_check_loss': float(test_check_loss),
             'valid_check_loss': float(valid_check_loss),
-            'test_mse': float(test_check_loss),  # For compatibility
-            'valid_mse': float(valid_check_loss),  # For compatibility
-            'test_rmse': float(np.sqrt(test_check_loss)),  # For compatibility
-            'valid_rmse': float(np.sqrt(valid_check_loss)),  # For compatibility
+            # Store as standard metric names for summary generation
+            'test_mse': float(test_check_loss),
+            'valid_mse': float(valid_check_loss),
+            'train_mse': float(train_check_loss),
+            'test_rmse': float(np.sqrt(test_check_loss)),
+            'valid_rmse': float(np.sqrt(valid_check_loss)),
+            'train_rmse': float(np.sqrt(train_check_loss)),
+            'test_mae': float(np.mean([quantile_results[q].get('test_mae', 0) for q in quantile_levels])),
+            'valid_mae': float(np.mean([quantile_results[q].get('valid_mae', 0) for q in quantile_levels])),
+            'train_mae': float(np.mean([quantile_results[q].get('train_mae', 0) for q in quantile_levels])),
+            'total_time_seconds': float(total_time),
         }
         
         # Use save_results function to handle JSON serialization
         save_results(aggregated_results, output_dir)
+        
+        # Generate combined quantile temporal plots
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"GENERATING COMBINED QUANTILE TEMPORAL PLOTS")
+            print(f"{'='*70}")
+        
+        # Load models for plotting
+        quantile_models = {}
+        for q_level in quantile_levels:
+            q_output_dir = output_dir / f'quantile_{q_level}'
+            model_path = q_output_dir / 'model_final.pt'
+            if model_path.exists():
+                # Recreate model (use first quantile's result to get config info)
+                first_result = quantile_results[quantile_levels[0]]
+                model_config = first_result.get('config', config)
+                
+                # Import model class
+                from stnf.models.st_interp import STInterpMLP
+                
+                q_model = STInterpMLP(
+                    k_spatial_centers=model_config['k_spatial_centers'],
+                    k_temporal_centers=model_config['k_temporal_centers'],
+                    spatial_basis_function=model_config.get('spatial_basis_function', 'wendland'),
+                    spatial_init_method='uniform',  # Use uniform to avoid train_coords requirement
+                    spatial_learnable=model_config.get('spatial_learnable', False),
+                    hidden_dims=model_config['hidden_dims'],
+                    p=model_config.get('p_covariates', 0),  # Use 'p' parameter name
+                    dropout=model_config.get('dropout', 0.0),
+                    layernorm=model_config.get('layernorm', False)
+                ).to(device)
+                
+                q_model.load_state_dict(torch.load(model_path, map_location=device))
+                quantile_models[q_level] = q_model
+        
+        # Get data from first quantile result
+        first_q_dir = output_dir / f'quantile_{quantile_levels[0]}'
+        pred_file = first_q_dir / 'predictions.npz'
+        if pred_file.exists():
+            pred_data = np.load(pred_file)
+            z_full_np = pred_data['true']
+            coords_np = pred_data['coords']
+            train_mask_np = pred_data['train_mask']
+            valid_mask_np = pred_data['valid_mask']
+            test_mask_np = pred_data['test_mask']
+            
+            # Convert to tensors
+            z_full_tensor = torch.tensor(z_full_np, dtype=torch.float32)
+            coords_tensor = torch.tensor(coords_np, dtype=torch.float32)
+            
+            # Plot combined quantile temporal series
+            plot_temporal_series(
+                None,  # No base model, only quantile models
+                z_full_tensor, coords_tensor, train_mask_np, device, output_dir,
+                valid_mask=valid_mask_np, test_mask=test_mask_np, n_sites=4,
+                quantile_models=quantile_models, quantile_levels=quantile_levels
+            )
         
         return aggregated_results
     
@@ -1731,6 +2179,8 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     train_metrics = evaluate_model(model, train_loader, device, config)
     if config.get('regression_type') == 'quantile':
         print(f"Train - Check Loss: {train_metrics.get('check_loss', train_metrics['mse']):.6f}, MAE: {train_metrics['mae']:.6f}")
+    elif config.get('regression_type') == 'multi-quantile':
+        print(f"Train - CRPS: {train_metrics['crps']:.6f}, Mean Check Loss: {train_metrics['mean_check_loss']:.6f}, MAE: {train_metrics['mae']:.6f}")
     else:
         print(f"Train - MSE: {train_metrics['mse']:.6f}, MAE: {train_metrics['mae']:.6f}, RMSE: {train_metrics['rmse']:.6f}")
     
@@ -1738,6 +2188,8 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     val_metrics = evaluate_model(model, val_loader, device, config)
     if config.get('regression_type') == 'quantile':
         print(f"Valid - Check Loss: {val_metrics.get('check_loss', val_metrics['mse']):.6f}, MAE: {val_metrics['mae']:.6f}")
+    elif config.get('regression_type') == 'multi-quantile':
+        print(f"Valid - CRPS: {val_metrics['crps']:.6f}, Mean Check Loss: {val_metrics['mean_check_loss']:.6f}, MAE: {val_metrics['mae']:.6f}")
     else:
         print(f"Valid - MSE: {val_metrics['mse']:.6f}, MAE: {val_metrics['mae']:.6f}, RMSE: {val_metrics['rmse']:.6f}")
     
@@ -1745,6 +2197,8 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     test_metrics = evaluate_model(model, test_loader, device, config)
     if config.get('regression_type') == 'quantile':
         print(f"Test  - Check Loss: {test_metrics.get('check_loss', test_metrics['mse']):.6f}, MAE: {test_metrics['mae']:.6f}")
+    elif config.get('regression_type') == 'multi-quantile':
+        print(f"Test  - CRPS: {test_metrics['crps']:.6f}, Mean Check Loss: {test_metrics['mean_check_loss']:.6f}, MAE: {test_metrics['mae']:.6f}")
     else:
         print(f"Test  - MSE: {test_metrics['mse']:.6f}, MAE: {test_metrics['mae']:.6f}, RMSE: {test_metrics['rmse']:.6f}")
     
@@ -1755,21 +2209,99 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     config_with_dir = config.copy()
     config_with_dir['output_dir'] = str(output_dir)
     
-    results = {
-        'experiment_id': experiment_id,
-        'experiment_seed': experiment_seed,
-        'config': config_with_dir,
-        'metrics': {
-            'train': train_metrics,
-            'valid': val_metrics,
-            'test': test_metrics
-        },
-        'training_history': history,
-        'total_time_seconds': total_time,
-        'total_time_formatted': f"{int(total_time//3600):02d}:{int((total_time%3600)//60):02d}:{int(total_time%60):02d}",
-        'model_parameters': sum(p.numel() for p in model.parameters()),
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
+    # For quantile regression, extract check_loss as primary metrics
+    if config.get('regression_type') == 'quantile':
+        results = {
+            'experiment_id': experiment_id,
+            'experiment_seed': experiment_seed,
+            'regression_type': 'quantile',
+            'quantile_level': config.get('current_quantile'),
+            'config': config_with_dir,
+            'metrics': {
+                'train': train_metrics,
+                'valid': val_metrics,
+                'test': test_metrics
+            },
+            # Use check_loss as primary metric for quantile regression
+            'train_check_loss': train_metrics.get('check_loss', train_metrics['mse']),
+            'valid_check_loss': val_metrics.get('check_loss', val_metrics['mse']),
+            'test_check_loss': test_metrics.get('check_loss', test_metrics['mse']),
+            # Keep compatibility with old format
+            'train_mse': train_metrics['mse'],
+            'valid_mse': val_metrics['mse'],
+            'test_mse': test_metrics['mse'],
+            'train_mae': train_metrics['mae'],
+            'valid_mae': val_metrics['mae'],
+            'test_mae': test_metrics['mae'],
+            'train_rmse': train_metrics['rmse'],
+            'valid_rmse': val_metrics['rmse'],
+            'test_rmse': test_metrics['rmse'],
+            'training_history': history,
+            'total_time_seconds': total_time,
+            'total_time_formatted': f"{int(total_time//3600):02d}:{int((total_time%3600)//60):02d}:{int(total_time%60):02d}",
+            'model_parameters': sum(p.numel() for p in model.parameters()),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    elif config.get('regression_type') == 'multi-quantile':
+        results = {
+            'experiment_id': experiment_id,
+            'experiment_seed': experiment_seed,
+            'regression_type': 'multi-quantile',
+            'quantile_levels': config.get('quantile_levels'),
+            'config': config_with_dir,
+            'metrics': {
+                'train': train_metrics,
+                'valid': val_metrics,
+                'test': test_metrics
+            },
+            # Use CRPS and mean check loss as primary metrics
+            'train_crps': train_metrics['crps'],
+            'valid_crps': val_metrics['crps'],
+            'test_crps': test_metrics['crps'],
+            'train_check_loss': train_metrics['mean_check_loss'],
+            'valid_check_loss': val_metrics['mean_check_loss'],
+            'test_check_loss': test_metrics['mean_check_loss'],
+            # Keep compatibility with old format (using median quantile)
+            'train_mse': train_metrics['mse'],
+            'valid_mse': val_metrics['mse'],
+            'test_mse': test_metrics['mse'],
+            'train_mae': train_metrics['mae'],
+            'valid_mae': val_metrics['mae'],
+            'test_mae': test_metrics['mae'],
+            'train_rmse': train_metrics['rmse'],
+            'valid_rmse': val_metrics['rmse'],
+            'test_rmse': test_metrics['rmse'],
+            'training_history': history,
+            'total_time_seconds': total_time,
+            'total_time_formatted': f"{int(total_time//3600):02d}:{int((total_time%3600)//60):02d}:{int(total_time%60):02d}",
+            'model_parameters': sum(p.numel() for p in model.parameters()),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    else:
+        results = {
+            'experiment_id': experiment_id,
+            'experiment_seed': experiment_seed,
+            'config': config_with_dir,
+            'metrics': {
+                'train': train_metrics,
+                'valid': val_metrics,
+                'test': test_metrics
+            },
+            'train_mse': train_metrics['mse'],
+            'valid_mse': val_metrics['mse'],
+            'test_mse': test_metrics['mse'],
+            'train_mae': train_metrics['mae'],
+            'valid_mae': val_metrics['mae'],
+            'test_mae': test_metrics['mae'],
+            'train_rmse': train_metrics['rmse'],
+            'valid_rmse': val_metrics['rmse'],
+            'test_rmse': test_metrics['rmse'],
+            'training_history': history,
+            'total_time_seconds': total_time,
+            'total_time_formatted': f"{int(total_time//3600):02d}:{int((total_time%3600)//60):02d}:{int(total_time%60):02d}",
+            'model_parameters': sum(p.numel() for p in model.parameters()),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
     
     save_results(results, output_dir)
     
@@ -1794,9 +2326,27 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     pred_data = plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir, 
                                  return_predictions=True, valid_mask=valid_mask, test_mask=test_mask)
     
+    # Plot temporal series
+    print("\n" + "="*50)
+    print("Generating Temporal Series Visualizations")
+    print("="*50)
+    
+    # Pass quantile_levels for multi-quantile models
+    regression_type = config.get('regression_type', 'mean')
+    if regression_type == 'multi-quantile':
+        quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
+                            valid_mask=valid_mask, test_mask=test_mask, n_sites=4,
+                            quantile_levels=quantile_levels)
+    else:
+        plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
+                            valid_mask=valid_mask, test_mask=test_mask, n_sites=4)
+    
     # Save predictions for later aggregation
+    train_predictions_array = None
     test_predictions_array = None
     valid_predictions_array = None
+    train_true_array = None
     test_true_array = None
     valid_true_array = None
     
@@ -1813,9 +2363,11 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         )
         print(f"Predictions saved to: {output_dir / 'predictions.npz'}")
         
-        # Extract test and validation predictions for quantile regression
+        # Extract train, test and validation predictions for quantile regression
+        train_predictions_array = all_predictions[train_mask_data]
         test_predictions_array = all_predictions[test_mask_data]
         valid_predictions_array = all_predictions[valid_mask_data]
+        train_true_array = z_full_data[train_mask_data]
         test_true_array = z_full_data[test_mask_data]
         valid_true_array = z_full_data[valid_mask_data]
     
@@ -1863,8 +2415,10 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     plot_basis_evolution(model_initial, model, train_coords, output_dir, config, basis_centers_history)
     
     # Add predictions to results for quantile regression
+    results['train_predictions'] = train_predictions_array
     results['test_predictions'] = test_predictions_array
     results['valid_predictions'] = valid_predictions_array
+    results['train_true'] = train_true_array
     results['test_true'] = test_true_array
     results['valid_true'] = valid_true_array
     
@@ -1903,8 +2457,12 @@ def create_averaged_spatial_mse(all_results, summary_dir):
     
     for result in all_results:
         # Find predictions.npz file
-        exp_dir = Path(result['config']['output_dir']) if 'output_dir' in result['config'] else None
-        if exp_dir is None:
+        # Handle both mean regression (nested 'config') and quantile (flat) formats
+        if 'config' in result and 'output_dir' in result['config']:
+            exp_dir = Path(result['config']['output_dir'])
+        elif 'output_dir' in result:
+            exp_dir = Path(result['output_dir'])
+        else:
             continue
             
         pred_file = exp_dir / 'predictions.npz'
@@ -2062,15 +2620,30 @@ def aggregate_results(all_results: list, summary_dir: Path):
     }
     
     for result in all_results:
-        metrics_data['train_mse'].append(result['metrics']['train']['mse'])
-        metrics_data['train_mae'].append(result['metrics']['train']['mae'])
-        metrics_data['train_rmse'].append(result['metrics']['train']['rmse'])
-        metrics_data['valid_mse'].append(result['metrics']['valid']['mse'])
-        metrics_data['valid_mae'].append(result['metrics']['valid']['mae'])
-        metrics_data['valid_rmse'].append(result['metrics']['valid']['rmse'])
-        metrics_data['test_mse'].append(result['metrics']['test']['mse'])
-        metrics_data['test_mae'].append(result['metrics']['test']['mae'])
-        metrics_data['test_rmse'].append(result['metrics']['test']['rmse'])
+        # Handle both quantile and mean regression formats
+        if 'metrics' in result:
+            # Mean regression format
+            metrics_data['train_mse'].append(result['metrics']['train']['mse'])
+            metrics_data['train_mae'].append(result['metrics']['train']['mae'])
+            metrics_data['train_rmse'].append(result['metrics']['train']['rmse'])
+            metrics_data['valid_mse'].append(result['metrics']['valid']['mse'])
+            metrics_data['valid_mae'].append(result['metrics']['valid']['mae'])
+            metrics_data['valid_rmse'].append(result['metrics']['valid']['rmse'])
+            metrics_data['test_mse'].append(result['metrics']['test']['mse'])
+            metrics_data['test_mae'].append(result['metrics']['test']['mae'])
+            metrics_data['test_rmse'].append(result['metrics']['test']['rmse'])
+        else:
+            # Quantile regression format (direct keys)
+            metrics_data['train_mse'].append(result.get('train_mse', 0))
+            metrics_data['train_mae'].append(result.get('train_mae', 0))
+            metrics_data['train_rmse'].append(result.get('train_rmse', 0))
+            metrics_data['valid_mse'].append(result.get('valid_mse', 0))
+            metrics_data['valid_mae'].append(result.get('valid_mae', 0))
+            metrics_data['valid_rmse'].append(result.get('valid_rmse', 0))
+            metrics_data['test_mse'].append(result.get('test_mse', 0))
+            metrics_data['test_mae'].append(result.get('test_mae', 0))
+            metrics_data['test_rmse'].append(result.get('test_rmse', 0))
+        
         metrics_data['total_time_seconds'].append(result['total_time_seconds'])
     
     # Compute statistics
@@ -2124,9 +2697,12 @@ def aggregate_results(all_results: list, summary_dir: Path):
     import pandas as pd
     
     df_data = {
-        'experiment_id': [r['experiment_id'] for r in all_results],
-        'experiment_seed': [r['experiment_seed'] for r in all_results],
+        'experiment_id': [r.get('experiment_id', i+1) for i, r in enumerate(all_results)],
     }
+    
+    # Add experiment_seed only if present in results (not available for quantile experiments)
+    if all_results and 'experiment_seed' in all_results[0]:
+        df_data['experiment_seed'] = [r['experiment_seed'] for r in all_results]
     
     for metric_name in metrics_data.keys():
         df_data[metric_name] = metrics_data[metric_name]

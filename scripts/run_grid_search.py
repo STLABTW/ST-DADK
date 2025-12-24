@@ -256,17 +256,17 @@ def main():
     # Define parameter grid
     param_grid = {
         # 'data_file': ['data/2a/2a_7.csv','data/2a/2a_8.csv', 'data/2a/2a_9.csv',
-        #               'data/2b/2b_7.csv','data/2b/2b_8.csv', 'data/2b/2b_9.csv'],  # Different data files
+                    #   'data/2b/2b_7.csv','data/2b/2b_8.csv', 'data/2b/2b_9.csv'],  # Different data files
         'data_file': ['data/2b/2b_8.csv'],  # Different data files
         # 'spatial_basis_function': ['wendland', 'gaussian', 'triangular'],  # NEW: Phase 1
         'spatial_basis_function': ['wendland'],  # NEW: Phase 1
         # 'spatial_init_method': ['uniform', 'gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
-        'spatial_init_method': ['gmm', 'random_site', 'kmeans_balanced'], # NEW: Phase 2
-        # 'spatial_init_method': ['kmeans_balanced'], # NEW: Phase 2
+        'spatial_init_method': ['uniform', 'kmeans_balanced'], # NEW: Phase 2
+        # 'spatial_init_method': ['uniform'], # NEW: Phase 2
         'spatial_learnable': [True, False],
-        # 'spatial_learnable': [True],
-        'obs_method': ['site-wise', 'random'],
-        # 'obs_method': ['random'],
+        # 'spatial_learnable': [False],
+        # 'obs_method': ['site-wise', 'random'],
+        'obs_method': ['random'],
         # 'obs_ratio': [0.10, 0.20],
         'obs_ratio': [0.10],
         'obs_spatial_pattern': ['corner', 'uniform'],

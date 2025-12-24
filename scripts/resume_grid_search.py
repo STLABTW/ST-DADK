@@ -252,7 +252,9 @@ def generate_grid_summary(grid_dir, config_dirs):
         for metric in ['test_rmse', 'test_mae', 'test_mse',
                        'valid_rmse', 'valid_mae', 'valid_mse',
                        'train_rmse', 'train_mae', 'train_mse',
-                       'total_time_seconds']:
+                       'total_time_seconds',
+                       'train_crps', 'test_crps', 'valid_crps',  # Quantile metrics
+                       'train_check_loss', 'test_check_loss', 'valid_check_loss']:
             if metric in summary['statistics']:
                 stats = summary['statistics'][metric]
                 record[f'{metric}_mean'] = stats['mean']

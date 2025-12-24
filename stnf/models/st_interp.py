@@ -619,13 +619,15 @@ class STInterpMLP(nn.Module):
                  train_coords: np.ndarray = None,
                  gradient_damping: bool = False,
                  damping_threshold: float = 0.3,
-                 damping_strength: float = 1.0):
+                 damping_strength: float = 1.0,
+                 output_dim: int = 1):  # For multi-quantile: output_dim = number of quantiles
         super().__init__()
         
         self.p = p
         self.k_spatial_centers = k_spatial_centers
         self.spatial_init_method = spatial_init_method
         self.spatial_basis_function = spatial_basis_function
+        self.output_dim = output_dim
         
         # Spatial basis embedding
         self.spatial_basis = SpatialBasisEmbedding(
@@ -661,8 +663,8 @@ class STInterpMLP(nn.Module):
                 layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
         
-        # Output layer
-        layers.append(nn.Linear(prev_dim, 1))
+        # Output layer: output_dim outputs (1 for mean/single quantile, Q for multi-quantile)
+        layers.append(nn.Linear(prev_dim, self.output_dim))
         
         self.mlp = nn.Sequential(*layers)
     
@@ -817,6 +819,16 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         config: configuration dictionary
         train_coords: (N, 2) numpy array of training coordinates for GMM initialization
     """
+    # Determine output dimension based on regression type
+    regression_type = config.get('regression_type', 'mean')
+    if regression_type == 'multi-quantile':
+        # For multi-quantile: output one value per quantile level
+        quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        output_dim = len(quantile_levels)
+    else:
+        # For mean or single quantile: output single value
+        output_dim = 1
+    
     return STInterpMLP(
         p=config.get('p_covariates', 0),
         k_spatial_centers=config.get('k_spatial_centers', [25, 81, 121]),
@@ -830,5 +842,6 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         train_coords=train_coords,
         gradient_damping=config.get('gradient_damping', False),
         damping_threshold=config.get('damping_threshold', 0.3),
-        damping_strength=config.get('damping_strength', 1.0)
+        damping_strength=config.get('damping_strength', 1.0),
+        output_dim=output_dim
     )

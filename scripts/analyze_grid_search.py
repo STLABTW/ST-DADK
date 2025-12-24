@@ -86,7 +86,9 @@ def regenerate_top_level_summaries(results_dir):
         for metric in ['test_rmse', 'test_mae', 'test_mse', 
                        'valid_rmse', 'valid_mae', 'valid_mse',
                        'train_rmse', 'train_mae', 'train_mse',
-                       'total_time_seconds']:
+                       'total_time_seconds',
+                       'train_crps', 'test_crps', 'valid_crps',  # Quantile metrics
+                       'train_check_loss', 'test_check_loss', 'valid_check_loss']:
             if metric in stats_dict:
                 stats = stats_dict[metric]
                 record[f'{metric}_mean'] = stats['mean']
@@ -118,7 +120,9 @@ def regenerate_top_level_summaries(results_dir):
                 for metric in ['test_rmse', 'test_mae', 'test_mse',
                                'valid_rmse', 'valid_mae', 'valid_mse',
                                'train_rmse', 'train_mae', 'train_mse',
-                               'total_time_seconds']:
+                               'total_time_seconds',
+                               'train_crps', 'test_crps', 'valid_crps',  # Quantile metrics
+                               'train_check_loss', 'test_check_loss', 'valid_check_loss']:
                     if metric in row:
                         detail_record[metric] = row[metric]
                 
@@ -236,6 +240,17 @@ def regenerate_config_summaries(results_dir):
                 'total_time_seconds': []
             }
             
+            # Add quantile-specific metrics if applicable
+            is_quantile = False
+            if all_results and all_results[0].get('regression_type') == 'quantile':
+                is_quantile = True
+                metrics_data['train_crps'] = []
+                metrics_data['test_crps'] = []
+                metrics_data['valid_crps'] = []
+                metrics_data['train_check_loss'] = []
+                metrics_data['test_check_loss'] = []
+                metrics_data['valid_check_loss'] = []
+            
             exp_records = []
             
             for result in all_results:
@@ -267,8 +282,17 @@ def regenerate_config_summaries(results_dir):
                 metrics_data['test_rmse'].append(test_metrics['rmse'])
                 metrics_data['total_time_seconds'].append(result.get('total_time_seconds', 0))
                 
+                # Add quantile-specific metrics
+                if is_quantile:
+                    metrics_data['train_crps'].append(result.get('train_crps', 0))
+                    metrics_data['test_crps'].append(result.get('test_crps', 0))
+                    metrics_data['valid_crps'].append(result.get('valid_crps', 0))
+                    metrics_data['train_check_loss'].append(result.get('train_check_loss', result.get('train_mse', 0)))
+                    metrics_data['test_check_loss'].append(result.get('test_check_loss', result.get('test_mse', 0)))
+                    metrics_data['valid_check_loss'].append(result.get('valid_check_loss', result.get('valid_mse', 0)))
+                
                 # Record for CSV
-                exp_records.append({
+                exp_record = {
                     'experiment_id': result.get('experiment_id', 0),
                     'experiment_seed': result.get('experiment_seed', 0),
                     'train_mse': train_metrics['mse'],
@@ -281,7 +305,17 @@ def regenerate_config_summaries(results_dir):
                     'test_mae': test_metrics['mae'],
                     'test_rmse': test_metrics['rmse'],
                     'total_time_seconds': result.get('total_time_seconds', 0)
-                })
+                }
+                
+                if is_quantile:
+                    exp_record['train_crps'] = result.get('train_crps', 0)
+                    exp_record['test_crps'] = result.get('test_crps', 0)
+                    exp_record['valid_crps'] = result.get('valid_crps', 0)
+                    exp_record['train_check_loss'] = result.get('train_check_loss', result.get('train_mse', 0))
+                    exp_record['test_check_loss'] = result.get('test_check_loss', result.get('test_mse', 0))
+                    exp_record['valid_check_loss'] = result.get('valid_check_loss', result.get('valid_mse', 0))
+                
+                exp_records.append(exp_record)
             
             # Compute statistics
             summary = {
@@ -401,12 +435,17 @@ def create_method_label(row, varying_params):
     for param in varying_params:
         value = row[param]
         
+        # Handle list/array parameters (e.g., k_spatial_centers)
+        if isinstance(value, (list, tuple, np.ndarray)):
+            # Convert to string representation, e.g., [16, 25] -> "16-25"
+            value_str = '-'.join(str(int(v)) for v in value)
+            label_parts.append(value_str)
         # Use abbreviation if available
-        if param in abbreviations and value in abbreviations[param]:
+        elif param in abbreviations and value in abbreviations[param]:
             label_parts.append(abbreviations[param][value])
         else:
-            # Fallback: use first 4 characters
-            label_parts.append(str(value)[:4].capitalize())
+            # Fallback: use string representation
+            label_parts.append(str(value)[:6])
     
     return '+'.join(label_parts)
 
@@ -634,11 +673,14 @@ def main():
                 
                 # Set labels
                 ax.set_xticks(positions)
-                ax.set_xticklabels(labels_for_plot, rotation=45, ha='right', fontsize=9)
+                ax.set_xticklabels(labels_for_plot, rotation=45, ha='right', fontsize=10)
                 ax.set_ylabel('Test RMSE', fontsize=10, fontweight='bold')
                 ax.set_title(f'{pattern.capitalize()} | {obs_method}, r={obs_ratio}', 
                             fontsize=11, fontweight='bold')
                 ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+                
+                # Adjust x-axis margins to prevent label cutoff
+                ax.margins(x=0.1)
         
         plt.tight_layout()
         
@@ -730,11 +772,14 @@ def main():
                     
                     # Set labels
                     ax.set_xticks(positions)
-                    ax.set_xticklabels(labels_for_plot, rotation=45, ha='right', fontsize=9)
+                    ax.set_xticklabels(labels_for_plot, rotation=45, ha='right', fontsize=10)
                     ax.set_ylabel('Test RMSE', fontsize=10, fontweight='bold')
                     ax.set_title(f'{pattern.capitalize()} | {obs_method}, r={obs_ratio}', 
                                 fontsize=11, fontweight='bold')
                     ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+                    
+                    # Adjust x-axis margins to prevent label cutoff
+                    ax.margins(x=0.1)
             
             plt.tight_layout()
             
