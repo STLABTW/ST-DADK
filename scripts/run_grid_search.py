@@ -265,8 +265,8 @@ def main():
         # 'spatial_init_method': ['uniform'], # NEW: Phase 2
         'spatial_learnable': [True, False],
         # 'spatial_learnable': [False],
-        # 'obs_method': ['site-wise', 'random'],
-        'obs_method': ['random'],
+        'obs_method': ['site-wise', 'random'],
+        # 'obs_method': ['random'],
         # 'obs_ratio': [0.10, 0.20],
         'obs_ratio': [0.10],
         'obs_spatial_pattern': ['corner', 'uniform'],

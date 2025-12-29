@@ -242,7 +242,8 @@ def regenerate_config_summaries(results_dir):
             
             # Add quantile-specific metrics if applicable
             is_quantile = False
-            if all_results and all_results[0].get('regression_type') == 'quantile':
+            regression_type = all_results[0].get('regression_type', 'mean') if all_results else 'mean'
+            if regression_type in ['quantile', 'multi-quantile']:
                 is_quantile = True
                 metrics_data['train_crps'] = []
                 metrics_data['test_crps'] = []
