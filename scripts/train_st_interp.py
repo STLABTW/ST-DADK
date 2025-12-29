@@ -826,10 +826,11 @@ def plot_training_curves(history, save_path):
     ax = axes[0]
     ax.plot(epochs, history['train_loss'], 'b-', label='Train Loss', linewidth=2)
     ax.plot(epochs, history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('MSE Loss')
-    ax.set_title('Training and Validation Loss')
-    ax.legend()
+    ax.set_xlabel('Epoch', fontsize=16)
+    ax.set_ylabel('MSE Loss', fontsize=16)
+    ax.set_title('Training and Validation Loss', fontsize=18, fontweight='bold')
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(fontsize=14)
     ax.grid(True, alpha=0.3)
     
     # Set y-axis limits based on epochs 2+ (ignore epoch 1)
@@ -847,9 +848,10 @@ def plot_training_curves(history, save_path):
     # RMSE
     ax = axes[1]
     ax.plot(epochs, history['val_rmse'], 'g-', linewidth=2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('RMSE')
-    ax.set_title('Validation RMSE')
+    ax.set_xlabel('Epoch', fontsize=16)
+    ax.set_ylabel('RMSE', fontsize=16)
+    ax.set_title('Validation RMSE', fontsize=18, fontweight='bold')
+    ax.tick_params(axis='both', which='major', labelsize=14)
     ax.grid(True, alpha=0.3)
     
     # Set y-axis limits based on epochs 2+ (ignore epoch 1)
@@ -866,9 +868,10 @@ def plot_training_curves(history, save_path):
     # Learning Rate
     ax = axes[2]
     ax.plot(epochs, history['lr'], 'purple', linewidth=2)
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Learning Rate')
-    ax.set_title('Learning Rate Schedule')
+    ax.set_xlabel('Epoch', fontsize=16)
+    ax.set_ylabel('Learning Rate', fontsize=16)
+    ax.set_title('Learning Rate Schedule', fontsize=18, fontweight='bold')
+    ax.tick_params(axis='both', which='major', labelsize=14)
     ax.grid(True, alpha=0.3)
     ax.set_yscale('log')  # Log scale to see changes better
     
@@ -967,12 +970,13 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
                   c='black', s=20, alpha=0.6, label='Train sites', edgecolors='white', linewidths=0.5)
         ax.scatter(spatial_centers[:, 0], spatial_centers[:, 1], 
                   c='red', s=basis_sizes, marker='x', alpha=0.5, label='Basis centers', linewidths=1.5)
-        ax.set_title(f't={t_idx+1} - True')
-        ax.set_xlabel('x')
-        ax.set_ylabel('y')
+        ax.set_title(f't={t_idx+1} - True', fontsize=16, fontweight='bold')
+        ax.set_xlabel('x', fontsize=14)
+        ax.set_ylabel('y', fontsize=14)
+        ax.tick_params(axis='both', which='major', labelsize=12)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc='upper right', fontsize=11)
         plt.colorbar(im, ax=ax)
         
         # Predicted values
@@ -982,12 +986,13 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
                   c='black', s=20, alpha=0.6, label='Train sites', edgecolors='white', linewidths=0.5)
         ax.scatter(spatial_centers[:, 0], spatial_centers[:, 1], 
                   c='red', s=basis_sizes, marker='x', alpha=0.5, label='Basis centers', linewidths=1.5)
-        ax.set_title(f't={t_idx+1} - Predicted')
-        ax.set_xlabel('x')
-        ax.set_ylabel('y')
+        ax.set_title(f't={t_idx+1} - Predicted', fontsize=16, fontweight='bold')
+        ax.set_xlabel('x', fontsize=14)
+        ax.set_ylabel('y', fontsize=14)
+        ax.tick_params(axis='both', which='major', labelsize=12)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc='upper right', fontsize=11)
         plt.colorbar(im, ax=ax)
         
         # Bias (pred - true)
@@ -999,12 +1004,13 @@ def plot_predictions(model, z_full, coords, train_mask, device, output_dir, n_ti
                   c='black', s=20, alpha=0.6, label='Train sites', edgecolors='white', linewidths=0.5)
         ax.scatter(spatial_centers[:, 0], spatial_centers[:, 1], 
                   c='red', s=basis_sizes, marker='x', alpha=0.5, label='Basis centers', linewidths=1.5)
-        ax.set_title(f't={t_idx+1} - Bias (Pred - True)')
-        ax.set_xlabel('x')
-        ax.set_ylabel('y')
+        ax.set_title(f't={t_idx+1} - Bias (Pred - True)', fontsize=16, fontweight='bold')
+        ax.set_xlabel('x', fontsize=14)
+        ax.set_ylabel('y', fontsize=14)
+        ax.tick_params(axis='both', which='major', labelsize=12)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc='upper right', fontsize=11)
         plt.colorbar(im, ax=ax)
     
     plt.tight_layout()
@@ -1100,13 +1106,16 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir,
     ax.scatter(spatial_centers[:, 0], spatial_centers[:, 1], 
               c='red', s=basis_sizes, marker='x', alpha=0.5, label='Basis centers', linewidths=1.5)
     
-    ax.set_title('Spatial MSE (Averaged over Time)')
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
+    ax.set_title('Spatial MSE (Averaged over Time)', fontsize=18, fontweight='bold')
+    ax.set_xlabel('x', fontsize=16)
+    ax.set_ylabel('y', fontsize=16)
+    ax.tick_params(axis='both', which='major', labelsize=14)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
-    ax.legend(loc='upper right', fontsize=10)
-    plt.colorbar(im, ax=ax, label='MSE')
+    ax.legend(loc='upper right', fontsize=13)
+    cbar = plt.colorbar(im, ax=ax, label='MSE')
+    cbar.ax.tick_params(labelsize=12)
+    cbar.set_label('MSE', fontsize=14)
     
     plt.tight_layout()
     save_path = output_dir / 'spatial_mse.png'
@@ -1406,37 +1415,45 @@ def plot_observation_pattern(coords, obs_mask, train_mask, valid_mask, output_di
     ax = axes[0, 0]
     scatter = ax.scatter(coords[:, 0], coords[:, 1], 
                         c=obs_counts, cmap='viridis', s=point_size, alpha=0.7)
-    ax.set_title(f'Total Observations per Site\n(Total: {obs_mask.sum()} obs)', fontsize=12)
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    plt.colorbar(scatter, ax=ax, label='# observations')
+    ax.set_title(f'Total Observations per Site\n(Total: {obs_mask.sum()} obs)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('x', fontsize=14)
+    ax.set_ylabel('y', fontsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    cbar = plt.colorbar(scatter, ax=ax, label='# observations')
+    cbar.ax.tick_params(labelsize=11)
     
     # Train observations
     ax = axes[0, 1]
     scatter = ax.scatter(coords[:, 0], coords[:, 1], 
                         c=train_counts, cmap='Blues', s=point_size, alpha=0.7)
-    ax.set_title(f'Train Observations per Site\n(Total: {train_mask.sum()} obs)', fontsize=12)
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    plt.colorbar(scatter, ax=ax, label='# observations')
+    ax.set_title(f'Train Observations per Site\n(Total: {train_mask.sum()} obs)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('x', fontsize=14)
+    ax.set_ylabel('y', fontsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    cbar = plt.colorbar(scatter, ax=ax, label='# observations')
+    cbar.ax.tick_params(labelsize=11)
     
     # Valid observations
     ax = axes[1, 0]
     scatter = ax.scatter(coords[:, 0], coords[:, 1], 
                         c=valid_counts, cmap='Greens', s=point_size, alpha=0.7)
-    ax.set_title(f'Valid Observations per Site\n(Total: {valid_mask.sum()} obs)', fontsize=12)
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    plt.colorbar(scatter, ax=ax, label='# observations')
+    ax.set_title(f'Valid Observations per Site\n(Total: {valid_mask.sum()} obs)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('x', fontsize=14)
+    ax.set_ylabel('y', fontsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    cbar = plt.colorbar(scatter, ax=ax, label='# observations')
+    cbar.ax.tick_params(labelsize=11)
     
     # Test (unobserved) count
     ax = axes[1, 1]
     scatter = ax.scatter(coords[:, 0], coords[:, 1], 
                         c=test_counts, cmap='Reds', s=point_size, alpha=0.7)
-    ax.set_title(f'Test (Unobserved) per Site\n(Total: {(~obs_mask).sum()} obs)', fontsize=12)
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    plt.colorbar(scatter, ax=ax, label='# unobserved')
+    ax.set_title(f'Test (Unobserved) per Site\n(Total: {(~obs_mask).sum()} obs)', fontsize=16, fontweight='bold')
+    ax.set_xlabel('x', fontsize=14)
+    ax.set_ylabel('y', fontsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    cbar = plt.colorbar(scatter, ax=ax, label='# unobserved')
+    cbar.ax.tick_params(labelsize=11)
     
     plt.tight_layout()
     save_path = output_dir / 'observation_pattern.png'
@@ -1573,13 +1590,14 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
                       for i, k in enumerate(k_spatial_centers)]
     legend_elements.insert(0, Patch(facecolor='lightgray', label='Train data'))
     
-    ax.set_title(f'Initial Basis Centers\n({init_method} initialization)', fontsize=14, fontweight='bold')
-    ax.set_xlabel('x', fontsize=12)
-    ax.set_ylabel('y', fontsize=12)
+    ax.set_title(f'Initial Basis Centers\n({init_method} initialization)', fontsize=20, fontweight='bold')
+    ax.set_xlabel('x', fontsize=18)
+    ax.set_ylabel('y', fontsize=18)
+    ax.tick_params(axis='both', which='major', labelsize=14)
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
     ax.set_aspect('equal')
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=14)
     ax.grid(True, alpha=0.2)
     
     # Plot 2: Final basis (after training)
@@ -1616,13 +1634,14 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
         n_active = (~inactive_basis_mask).sum()
         title_suffix += f'\n🎯 {n_active} active, {n_inactive} removed (sparsity)'
     
-    ax.set_title(f'Final Basis Centers{title_suffix}', fontsize=14, fontweight='bold')
-    ax.set_xlabel('x', fontsize=12)
-    ax.set_ylabel('y', fontsize=12)
+    ax.set_title(f'Final Basis Centers{title_suffix}', fontsize=20, fontweight='bold')
+    ax.set_xlabel('x', fontsize=18)
+    ax.set_ylabel('y', fontsize=18)
+    ax.tick_params(axis='both', which='major', labelsize=14)
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
     ax.set_aspect('equal')
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=14)
     ax.grid(True, alpha=0.2)
     
     # Plot 3: Movement (only if learnable)
@@ -1721,13 +1740,14 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
         if movement_penalty > 0:
             title_text += f'Movement Penalty: λ={movement_penalty}'
         
-        ax.set_title(title_text, fontsize=13, fontweight='bold')
-        ax.set_xlabel('x', fontsize=12)
-        ax.set_ylabel('y', fontsize=12)
+        ax.set_title(title_text, fontsize=18, fontweight='bold')
+        ax.set_xlabel('x', fontsize=18)
+        ax.set_ylabel('y', fontsize=18)
+        ax.tick_params(axis='both', which='major', labelsize=14)
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
         ax.set_aspect('equal')
-        ax.legend(loc='upper right', fontsize=9)
+        ax.legend(loc='upper right', fontsize=14)
         ax.grid(True, alpha=0.2)
     
     plt.tight_layout()

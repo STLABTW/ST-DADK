@@ -1,7 +1,7 @@
 # Spatio-Temporal Interpolation Model Configuration
 
-# Experiment tag
-tag: test_quantile
+# Experiment tag (used in output directory name)
+tag: integrated
 
 # Data paths
 data_file: data/2a/2a_8.csv  # Full data file
