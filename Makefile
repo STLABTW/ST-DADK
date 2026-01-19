@@ -1,6 +1,10 @@
 SHELL := /bin/bash
-EXECUTABLE := poetry run
 CONDA_ENV ?= st-dadk
+
+# Initialize conda and activate environment
+CONDA_BASE := $(shell conda info --base 2>/dev/null || echo "/opt/conda")
+CONDA_ACTIVATE := source $(CONDA_BASE)/etc/profile.d/conda.sh && conda activate $(CONDA_ENV)
+EXECUTABLE := $(CONDA_ACTIVATE) && poetry run
 
 .PHONY: help clean install install-dev test test-cov lint format run-local-jupyter train grid-search analyze resume
 
@@ -34,7 +38,7 @@ help:
 ## Install project dependencies with Poetry
 install:
 	@echo "Installing project dependencies with Poetry..."
-	@poetry install --with dev
+	@$(CONDA_ACTIVATE) && poetry install --with dev
 
 ## Install development dependencies (conda)
 install-dev:
@@ -44,25 +48,25 @@ install-dev:
 ## Run tests
 test:
 	@echo "Running tests..."
-	@$(EXECUTABLE) pytest tests/ -v
+	@$(CONDA_ACTIVATE) && poetry run pytest tests/ -v
 
 ## Run tests with coverage
 test-cov:
 	@echo "Running tests with coverage..."
-	@$(EXECUTABLE) pytest tests/ -v --cov=stnf --cov-report=html --cov-report=term
+	@$(CONDA_ACTIVATE) && poetry run pytest tests/ -v --cov=stnf --cov-report=html --cov-report=term
 
 ## Run linters
 lint:
 	@echo "Running linters..."
-	@$(EXECUTABLE) python -m black --check stnf scripts
-	@$(EXECUTABLE) python -m isort --check-only stnf scripts
-	@$(EXECUTABLE) python -m mypy stnf --ignore-missing-imports || true
+	@$(CONDA_ACTIVATE) && poetry run python -m black --check stnf scripts
+	@$(CONDA_ACTIVATE) && poetry run python -m isort --check-only stnf scripts
+	@$(CONDA_ACTIVATE) && poetry run python -m mypy stnf --ignore-missing-imports || true
 
 ## Format code
 format:
 	@echo "Formatting code..."
-	@$(EXECUTABLE) python -m black stnf scripts
-	@$(EXECUTABLE) python -m isort stnf scripts
+	@$(CONDA_ACTIVATE) && poetry run python -m black stnf scripts
+	@$(CONDA_ACTIVATE) && poetry run python -m isort stnf scripts
 
 ## Start Jupyter server locally
 run-local-jupyter:
@@ -72,12 +76,12 @@ run-local-jupyter:
 ## Train model with default config
 train:
 	@echo "Training model..."
-	@$(EXECUTABLE) python scripts/train_st_interp.py --config configs/config_st_interp.yaml
+	@$(CONDA_ACTIVATE) && poetry run python scripts/train_st_interp.py --config configs/config_st_interp.yaml
 
 ## Run grid search experiments
 grid-search:
 	@echo "Running grid search..."
-	@$(EXECUTABLE) python scripts/run_grid_search.py --config configs/config_st_interp.yaml --parallel --n_jobs 10
+	@$(CONDA_ACTIVATE) && poetry run python scripts/run_grid_search.py --config configs/config_st_interp.yaml --parallel --n_jobs 10
 
 ## Analyze grid search results (requires results directory)
 analyze:
@@ -87,7 +91,7 @@ analyze:
 		echo "[ERROR] Please specify RESULTS_DIR"; \
 		exit 1; \
 	fi
-	@$(EXECUTABLE) python scripts/analyze_grid_search.py $(RESULTS_DIR)
+	@$(CONDA_ACTIVATE) && poetry run python scripts/analyze_grid_search.py $(RESULTS_DIR)
 
 ## Clean up temporary files
 clean:
