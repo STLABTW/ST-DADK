@@ -45,3 +45,6 @@ Thumbs.db
 *.bak
 *.swp
 *~
+
+# Summary and discussion files
+hackmd_summary_slides.md
