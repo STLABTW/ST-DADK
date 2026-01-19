@@ -1,0 +1,118 @@
+[tool.poetry]
+name = "st-dadk"
+version = "0.1.0"
+description = "Spatio-Temporal Interpolation Model for KAUST Competition"
+authors = [
+    "Joseph Wang <egpivo@gmail.com>"
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10.13"
+torch = "^2.0.0"
+numpy = "^1.24.0"
+pandas = "^2.0.0"
+pyyaml = "^6.0.1"
+tqdm = "^4.65.0"
+matplotlib = "^3.7.0"
+scikit-learn = "^1.3.0"
+k-means-constrained = "^0.7.3"
+scipy = "^1.12.0"
+joblib = "^1.3.0"
+seaborn = "^0.13.0"
+
+[tool.poetry.group.dev.dependencies]
+black = "^22.3.0"
+isort = "^5.10.1"
+mypy = "^0.971"
+pydocstyle = { extras = ["toml"], version = "^6.1.1" }
+pytest = "^7.1.3"
+pytest-cov = "^4.1.0"
+poethepoet = "^0.15.0"
+coverage = { extras = ["toml"], version = "^6.4.4" }
+pre-commit = "^2.20.0"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.notebook.dependencies]
+ipykernel = "^6.29.4"
+ipython = "^8.24.0"
+jupyter = "^1.0.0"
+jupyterlab = "^4.1.7"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+target-version = ['py310']
+line-length = 100
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_glob = ["*/__pycache__/*", "*/migrations/*", "*/venv/*", "*/.venv/*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torchvision.*",
+    "sklearn.*",
+    "scipy.*",
+    "pandas.*",
+    "numpy.*",
+    "matplotlib.*",
+    "seaborn.*",
+]
+ignore_missing_imports = true
+
+[tool.pydocstyle]
+convention = "google"
+match = '(?!__init__).*\.py'
+match-dir = '(?!\.git|\.venv|venv|build|dist).*'
+
+[tool.coverage.run]
+source = ["stnf"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+precision = 2
+show_missing = true
+skip_covered = false
