@@ -52,7 +52,7 @@ poetry install --with dev
 - `configs/`: Configuration files
 - `data/`: Dataset files
 - `envs/`: Environment setup scripts (conda and jupyter)
-- `bin/`: Utility scripts
+- `envs/.bin/`: Utility scripts
 
 ## Usage
 
@@ -89,5 +89,5 @@ conda init bash  # or zsh
 
 Make shell scripts executable:
 ```bash
-chmod +x envs/**/*.sh bin/*.sh
+chmod +x envs/**/*.sh envs/.bin/*.sh
 ```

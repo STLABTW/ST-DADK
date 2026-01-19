@@ -1,5 +1,5 @@
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${DIR}/../bin/color_map.sh"
+source "${DIR}/.bin/color_map.sh"
 
 
 check_file_exists() {

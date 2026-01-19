@@ -2,9 +2,9 @@
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_BASE_PATH="${DIR}/../.."
 
-# Source exit_code.sh and color_map.sh - check both bin/ and envs/ locations
-if [ -f "${PACKAGE_BASE_PATH}/bin/exit_code.sh" ]; then
-  source "${PACKAGE_BASE_PATH}/bin/exit_code.sh"
+# Source exit_code.sh and color_map.sh - check envs/.bin/ and envs/ locations
+if [ -f "${PACKAGE_BASE_PATH}/envs/.bin/exit_code.sh" ]; then
+  source "${PACKAGE_BASE_PATH}/envs/.bin/exit_code.sh"
 elif [ -f "${PACKAGE_BASE_PATH}/envs/exit_code.sh" ]; then
   source "${PACKAGE_BASE_PATH}/envs/exit_code.sh"
 else
@@ -13,8 +13,8 @@ else
   SUCCESS_EXITCODE=0
 fi
 
-if [ -f "${PACKAGE_BASE_PATH}/bin/color_map.sh" ]; then
-  source "${PACKAGE_BASE_PATH}/bin/color_map.sh"
+if [ -f "${PACKAGE_BASE_PATH}/envs/.bin/color_map.sh" ]; then
+  source "${PACKAGE_BASE_PATH}/envs/.bin/color_map.sh"
 elif [ -f "${PACKAGE_BASE_PATH}/envs/color_map.sh" ]; then
   source "${PACKAGE_BASE_PATH}/envs/color_map.sh"
 else

@@ -39,15 +39,15 @@ NOTEBOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${NOTEBOOK_DIR}/utils.sh"
 PACKAGE_BASE_PATH="${NOTEBOOK_DIR}/../.."
 
-# Source color_map.sh and exit_code.sh - check both bin/ and envs/ locations
-if [ -f "${PACKAGE_BASE_PATH}/bin/color_map.sh" ]; then
-  source "${PACKAGE_BASE_PATH}/bin/color_map.sh"
+# Source color_map.sh and exit_code.sh - check envs/.bin/ and envs/ locations
+if [ -f "${PACKAGE_BASE_PATH}/envs/.bin/color_map.sh" ]; then
+  source "${PACKAGE_BASE_PATH}/envs/.bin/color_map.sh"
 elif [ -f "${PACKAGE_BASE_PATH}/envs/color_map.sh" ]; then
   source "${PACKAGE_BASE_PATH}/envs/color_map.sh"
 fi
 
-if [ -f "${PACKAGE_BASE_PATH}/bin/exit_code.sh" ]; then
-  source "${PACKAGE_BASE_PATH}/bin/exit_code.sh"
+if [ -f "${PACKAGE_BASE_PATH}/envs/.bin/exit_code.sh" ]; then
+  source "${PACKAGE_BASE_PATH}/envs/.bin/exit_code.sh"
 elif [ -f "${PACKAGE_BASE_PATH}/envs/exit_code.sh" ]; then
   source "${PACKAGE_BASE_PATH}/envs/exit_code.sh"
 fi
