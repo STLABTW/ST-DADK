@@ -2,7 +2,34 @@ SHELL := /bin/bash
 EXECUTABLE := poetry run
 CONDA_ENV ?= st-dadk
 
-.PHONY: clean install install-dev test test-cov lint format run-local-jupyter
+.PHONY: help clean install install-dev test test-cov lint format run-local-jupyter train grid-search analyze resume
+
+.DEFAULT_GOAL := help
+
+## Show this help message
+help:
+	@echo "ST-DADK Makefile Commands"
+	@echo ""
+	@echo "Environment Setup:"
+	@echo "  make install          Install project dependencies with Poetry"
+	@echo "  make install-dev      Install development dependencies in conda environment"
+	@echo ""
+	@echo "Code Quality:"
+	@echo "  make lint             Run linters (black, isort, mypy)"
+	@echo "  make format           Format code with black and isort"
+	@echo "  make test             Run tests"
+	@echo "  make test-cov         Run tests with coverage report"
+	@echo ""
+	@echo "Training & Experiments:"
+	@echo "  make train            Train model with default config"
+	@echo "  make grid-search      Run grid search experiments"
+	@echo "  make analyze          Analyze grid search results"
+	@echo ""
+	@echo "Utilities:"
+	@echo "  make run-local-jupyter Start Jupyter Lab server"
+	@echo "  make clean            Clean up temporary files"
+	@echo ""
+	@echo "For detailed script usage, see scripts/README.md"
 
 ## Install project dependencies with Poetry
 install:
@@ -41,6 +68,26 @@ format:
 run-local-jupyter:
 	@echo "Starting local Jupyter server..."
 	@$(SHELL) envs/jupyter/start_jupyter_lab.sh --port 8501
+
+## Train model with default config
+train:
+	@echo "Training model..."
+	@$(EXECUTABLE) python scripts/train_st_interp.py --config configs/config_st_interp.yaml
+
+## Run grid search experiments
+grid-search:
+	@echo "Running grid search..."
+	@$(EXECUTABLE) python scripts/run_grid_search.py --config configs/config_st_interp.yaml --parallel --n_jobs 10
+
+## Analyze grid search results (requires results directory)
+analyze:
+	@echo "Analyzing grid search results..."
+	@echo "Usage: make analyze RESULTS_DIR=results/YYYYMMDD_grid_search"
+	@if [ -z "$(RESULTS_DIR)" ]; then \
+		echo "[ERROR] Please specify RESULTS_DIR"; \
+		exit 1; \
+	fi
+	@$(EXECUTABLE) python scripts/analyze_grid_search.py $(RESULTS_DIR)
 
 ## Clean up temporary files
 clean:
