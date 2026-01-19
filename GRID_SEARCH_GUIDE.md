@@ -1,40 +1,40 @@
-# Grid Search 실험 시스템 사용 가이드
+# Grid Search Experiment System User Guide
 
-## 개요
+## Overview
 
-모든 하이퍼파라미터 조합에 대해 자동으로 실험을 수행하고, 결과를 구조화된 CSV 파일로 저장하는 시스템입니다.
+A system that automatically performs experiments for all hyperparameter combinations and saves results in structured CSV files.
 
-## 구조 변경 사항
+## Structural Changes
 
-### 이전 방식
-- 32개의 개별 config 파일 생성 (config_1.yaml ~ config_32.yaml)
-- 각 config를 순차적으로 실행
-- 결과가 개별 폴더에 분산 저장
-- 수동으로 결과 수집 및 정리 필요
+### Previous Approach
+- Created 32 individual config files (config_1.yaml ~ config_32.yaml)
+- Executed each config sequentially
+- Results stored in separate folders
+- Manual result collection and organization required
 
-### 새로운 방식
-- **단일 base config 파일** (config_st_interp.yaml)
-- **파라미터 그리드 정의** (run_grid_search.py에서)
-- **자동 조합 생성 및 실행**
-- **통합 CSV 파일 출력**:
-  - `grid_search_summary.csv`: 각 config의 요약 통계
-  - `grid_search_detail.csv`: 각 iteration의 raw 값
-  - `grid_search_configs.csv`: 전체 config 정보
+### New Approach
+- **Single base config file** (config_st_interp.yaml)
+- **Parameter grid definition** (in run_grid_search.py)
+- **Automatic combination generation and execution**
+- **Unified CSV file output**:
+  - `grid_search_summary.csv`: Summary statistics for each config
+  - `grid_search_detail.csv`: Raw values for each iteration
+  - `grid_search_configs.csv`: Complete config information
 
-## 파일 구조
+## File Structure
 
 ```
 ST-DADK/
 ├── configs/
 │   └── config_st_interp.yaml          # Base configuration
 ├── scripts/
-│   ├── train_st_interp.py             # 기존 학습 스크립트 (수정됨)
-│   └── run_grid_search.py             # 새로운 Grid Search 러너
+│   ├── train_st_interp.py             # Existing training script (modified)
+│   └── run_grid_search.py             # New Grid Search runner
 └── results/
     └── YYYYMMDD_grid_search/
-        ├── grid_search_summary.csv     # 요약 통계
-        ├── grid_search_detail.csv      # 상세 결과
-        ├── grid_search_configs.csv     # Config 정보
+        ├── grid_search_summary.csv     # Summary statistics
+        ├── grid_search_detail.csv      # Detailed results
+        ├── grid_search_configs.csv     # Config information
         └── config001_uni_lrn_site_10_cor/
             ├── config.yaml
             ├── experiments/
@@ -46,11 +46,11 @@ ST-DADK/
                 └── all_experiments.csv
 ```
 
-## 사용 방법
+## Usage
 
-### 1. 파라미터 그리드 정의
+### 1. Define Parameter Grid
 
-`scripts/run_grid_search.py`에서 실험하고 싶은 파라미터 조합을 정의:
+Define the parameter combinations you want to experiment with in `scripts/run_grid_search.py`:
 
 ```python
 param_grid = {
@@ -62,14 +62,14 @@ param_grid = {
 }
 ```
 
-### 2. 실험 실행
+### 2. Run Experiments
 
-**순차 실행:**
+**Sequential execution:**
 ```bash
 python scripts/run_grid_search.py --config configs/config_st_interp.yaml
 ```
 
-**병렬 실행 (권장):**
+**Parallel execution (recommended):**
 ```bash
 python scripts/run_grid_search.py \
     --config configs/config_st_interp.yaml \
@@ -77,7 +77,7 @@ python scripts/run_grid_search.py \
     --n_jobs 10
 ```
 
-**출력 디렉토리 지정:**
+**Specify output directory:**
 ```bash
 python scripts/run_grid_search.py \
     --config configs/config_st_interp.yaml \
@@ -86,11 +86,11 @@ python scripts/run_grid_search.py \
     --n_jobs 10
 ```
 
-### 3. 결과 분석
+### 3. Analyze Results
 
 #### Summary CSV (grid_search_summary.csv)
 
-각 config의 평균 성능:
+Average performance for each config:
 
 ```python
 import pandas as pd
@@ -109,7 +109,7 @@ for method in df['spatial_init_method'].unique():
 
 #### Detail CSV (grid_search_detail.csv)
 
-각 iteration의 raw 값:
+Raw values for each iteration:
 
 ```python
 df_detail = pd.read_csv('results/20251203_grid_search/grid_search_detail.csv')
@@ -125,60 +125,60 @@ group2 = df_detail[df_detail['config_id'] == 2]['test_rmse']
 t_stat, p_value = stats.ttest_ind(group1, group2)
 ```
 
-## 출력 파일 상세
+## Output File Details
 
 ### 1. grid_search_summary.csv
 
-각 config당 1행, 요약 통계 포함:
+One row per config, including summary statistics:
 
-| 컬럼 | 설명 |
-|------|------|
-| config_id | Config 번호 (1-32) |
-| tag | Config 식별자 |
+| Column | Description |
+|--------|-------------|
+| config_id | Config number (1-32) |
+| tag | Config identifier |
 | spatial_init_method | 'uniform' or 'gmm' |
 | spatial_learnable | True or False |
 | obs_method | 'site-wise' or 'random' |
 | obs_ratio | 0.1 or 0.3 |
 | obs_spatial_pattern | 'corner' or 'uniform' |
-| n_experiments | 반복 실험 수 |
-| test_rmse_mean | Test RMSE 평균 |
-| test_rmse_std | Test RMSE 표준편차 |
-| test_rmse_min | Test RMSE 최소값 |
-| test_rmse_max | Test RMSE 최대값 |
-| test_rmse_median | Test RMSE 중앙값 |
-| ... | (다른 metric들도 동일) |
+| n_experiments | Number of repeated experiments |
+| test_rmse_mean | Test RMSE mean |
+| test_rmse_std | Test RMSE standard deviation |
+| test_rmse_min | Test RMSE minimum |
+| test_rmse_max | Test RMSE maximum |
+| test_rmse_median | Test RMSE median |
+| ... | (same for other metrics) |
 
 ### 2. grid_search_detail.csv
 
-각 config의 각 iteration마다 1행:
+One row per iteration for each config:
 
-| 컬럼 | 설명 |
-|------|------|
-| config_id | Config 번호 |
-| tag | Config 식별자 |
-| experiment_id | Iteration 번호 (1-10) |
-| spatial_init_method | Config 설정 |
-| ... | (다른 config 설정들) |
-| test_rmse | 해당 iteration의 Test RMSE |
-| test_mae | 해당 iteration의 Test MAE |
-| test_mse | 해당 iteration의 Test MSE |
-| valid_rmse | 해당 iteration의 Valid RMSE |
-| ... | (다른 metric들) |
-| total_time_seconds | 학습 시간 (초) |
+| Column | Description |
+|--------|-------------|
+| config_id | Config number |
+| tag | Config identifier |
+| experiment_id | Iteration number (1-10) |
+| spatial_init_method | Config setting |
+| ... | (other config settings) |
+| test_rmse | Test RMSE for this iteration |
+| test_mae | Test MAE for this iteration |
+| test_mse | Test MSE for this iteration |
+| valid_rmse | Valid RMSE for this iteration |
+| ... | (other metrics) |
+| total_time_seconds | Training time (seconds) |
 
 ### 3. grid_search_configs.csv
 
-전체 config 정보 저장 (JSON 형태):
+Stores complete config information (JSON format):
 
-| 컬럼 | 설명 |
-|------|------|
-| config_id | Config 번호 |
-| tag | Config 식별자 |
-| config_json | 전체 config (JSON 문자열) |
+| Column | Description |
+|--------|-------------|
+| config_id | Config number |
+| tag | Config identifier |
+| config_json | Complete config (JSON string) |
 
-## 시각화 예시
+## Visualization Examples
 
-### 1. Heatmap 비교
+### 1. Heatmap Comparison
 
 ```python
 import pandas as pd
@@ -201,7 +201,7 @@ plt.tight_layout()
 plt.savefig('heatmap.png')
 ```
 
-### 2. Factor 효과 비교
+### 2. Factor Effect Comparison
 
 ```python
 import pandas as pd
@@ -253,42 +253,42 @@ plt.grid(True)
 plt.savefig('interaction_plot.png')
 ```
 
-## 장점
+## Advantages
 
-1. **재현성**: 모든 실험이 동일한 base config에서 시작
-2. **확장성**: 파라미터 추가가 쉬움 (param_grid만 수정)
-3. **분석 용이**: 구조화된 CSV로 다양한 분석 가능
-4. **병렬화**: 모든 config를 동시에 실행 가능
-5. **추적성**: 모든 config와 결과가 자동으로 저장
+1. **Reproducibility**: All experiments start from the same base config
+2. **Scalability**: Easy to add parameters (just modify param_grid)
+3. **Easy Analysis**: Various analyses possible with structured CSV
+4. **Parallelization**: All configs can be executed simultaneously
+5. **Traceability**: All configs and results are automatically saved
 
-## 추가 파라미터 실험하기
+## Experimenting with Additional Parameters
 
-다른 파라미터를 추가하고 싶다면 `run_grid_search.py`에서:
+To add other parameters, modify `run_grid_search.py`:
 
 ```python
 param_grid = {
-    # 기존 파라미터
+    # Existing parameters
     'spatial_init_method': ['uniform', 'gmm'],
     'spatial_learnable': [True, False],
     
-    # 새로운 파라미터 추가
+    # Add new parameters
     'lr': [1e-3, 5e-3, 1e-2],
     'hidden_dims': [[128, 128], [256, 256, 128]],
     'dropout': [0.0, 0.1, 0.2],
 }
 ```
 
-## 문제 해결
+## Troubleshooting
 
-### 메모리 부족
+### Out of Memory
 ```bash
-# n_jobs 줄이기
+# Reduce n_jobs
 python scripts/run_grid_search.py --parallel --n_jobs 5
 ```
 
-### 특정 config만 재실행
+### Re-run Specific Config Only
 ```python
-# Python에서 직접 실행
+# Run directly in Python
 from scripts.train_st_interp import run_multiple_experiments
 import yaml
 
@@ -297,7 +297,7 @@ with open('configs/config_st_interp.yaml') as f:
 
 config['spatial_init_method'] = 'gmm'
 config['obs_ratio'] = 0.3
-# ... 다른 설정
+# ... other settings
 
 summary = run_multiple_experiments(config, 'results/rerun', 'cpu', parallel=True)
 ```

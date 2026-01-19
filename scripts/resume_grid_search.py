@@ -32,13 +32,13 @@ def main():
     
     grid_dir = Path(args.grid_dir)
     if not grid_dir.exists():
-        print(f"❌ Grid directory not found: {grid_dir}")
+        print(f"[ERROR] Grid directory not found: {grid_dir}")
         return
     
     # Validate arguments
     if not args.summarize_only:
         if args.start_exp_id is None or args.end_exp_id is None:
-            print(f"❌ --start_exp_id and --end_exp_id are required unless --summarize-only is used")
+            print(f"[ERROR] --start_exp_id and --end_exp_id are required unless --summarize-only is used")
             return
     
     # Find all actual config directories (with config.yaml inside)
@@ -86,12 +86,12 @@ def main():
                     n_exp = summary.get('n_experiments', 0)
                     test_rmse_mean = summary.get('statistics', {}).get('test_rmse', {}).get('mean', 0)
                     test_rmse_std = summary.get('statistics', {}).get('test_rmse', {}).get('std', 0)
-                    print(f"  ✓ Summary regenerated: {n_exp} experiments")
+                    print(f"  [OK] Summary regenerated: {n_exp} experiments")
                     print(f"    RMSE: {test_rmse_mean:.4f} ± {test_rmse_std:.4f}")
                 else:
-                    print(f"  ⚠️  No completed experiments found")
+                    print(f"  [WARNING] No completed experiments found")
             except Exception as e:
-                print(f"  ✗ FAILED: {e}")
+                print(f"  [FAILED] FAILED: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -133,13 +133,13 @@ def main():
                     n_exp = summary.get('n_experiments', 0)
                     test_rmse_mean = summary.get('statistics', {}).get('test_rmse', {}).get('mean', 0)
                     test_rmse_std = summary.get('statistics', {}).get('test_rmse', {}).get('std', 0)
-                    print(f"  ✓ Completed successfully: {n_exp} experiments")
+                    print(f"  [OK] Completed successfully: {n_exp} experiments")
                     print(f"    RMSE: {test_rmse_mean:.4f} ± {test_rmse_std:.4f}")
                 else:
-                    print(f"  ⚠️  Completed but no summary generated")
+                    print(f"  [WARNING] Completed but no summary generated")
                     
             except Exception as e:
-                print(f"  ✗ FAILED: {e}")
+                print(f"  [FAILED] FAILED: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -157,11 +157,11 @@ def main():
     
     try:
         generate_grid_summary(grid_dir, config_dirs)
-        print(f"\n✓ Grid search summary files generated successfully!")
+        print(f"\n[OK] Grid search summary files generated successfully!")
         print(f"\nTo analyze results, run:")
         print(f"  python scripts/analyze_grid_search.py {grid_dir}")
     except Exception as e:
-        print(f"\n⚠️  Failed to generate grid summary: {e}")
+        print(f"\n[WARNING] Failed to generate grid summary: {e}")
         import traceback
         traceback.print_exc()
 
@@ -207,7 +207,7 @@ def generate_grid_summary(grid_dir, config_dirs):
         summary_json = config_dir / 'summary' / 'summary_statistics.json'  # Load JSON instead of CSV
         
         if not summary_json.exists():
-            print(f"  ⚠️  Skipping {config_dir.name}: no summary found")
+            print(f"  [WARNING] Skipping {config_dir.name}: no summary found")
             continue
         
         # Load config
@@ -224,7 +224,7 @@ def generate_grid_summary(grid_dir, config_dirs):
         })
     
     if len(all_summaries) == 0:
-        print("⚠️  No summaries found to aggregate")
+        print("[WARNING] No summaries found to aggregate")
         return
     
     print(f"Found {len(all_summaries)} config summaries to aggregate")
@@ -269,7 +269,7 @@ def generate_grid_summary(grid_dir, config_dirs):
     df_summary = pd.DataFrame(summary_records)
     summary_file = grid_dir / 'grid_search_summary.csv'
     df_summary.to_csv(summary_file, index=False)
-    print(f"✓ Summary saved: {summary_file}")
+    print(f"[OK] Summary saved: {summary_file}")
     
     # 2. Detailed results per iteration
     detail_records = []
@@ -320,7 +320,7 @@ def generate_grid_summary(grid_dir, config_dirs):
         df_detail = pd.DataFrame(detail_records)
         detail_file = grid_dir / 'grid_search_detail.csv'
         df_detail.to_csv(detail_file, index=False)
-        print(f"✓ Detailed results saved: {detail_file}")
+        print(f"[OK] Detailed results saved: {detail_file}")
     
     # 3. Save configs as JSON
     configs_dict = {}
@@ -338,12 +338,12 @@ def generate_grid_summary(grid_dir, config_dirs):
     config_json_file = grid_dir / 'grid_search_configs.json'
     with open(config_json_file, 'w', encoding='utf-8') as f:
         json.dump(configs_dict, f, indent=2, ensure_ascii=False)
-    print(f"✓ Configurations saved: {config_json_file}")
+    print(f"[OK] Configurations saved: {config_json_file}")
     
     df_configs = pd.DataFrame(config_records)
     config_file = grid_dir / 'grid_search_configs.csv'
     df_configs.to_csv(config_file, index=False)
-    print(f"✓ Configuration index saved: {config_file}")
+    print(f"[OK] Configuration index saved: {config_file}")
 
 
 if __name__ == '__main__':

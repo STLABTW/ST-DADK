@@ -568,7 +568,7 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             
             # Check for NaN
             if np.isnan(loss.item()):
-                print(f"\n⚠️ NaN detected at batch {len(train_loader)}!")
+                print(f"\n[WARNING] NaN detected at batch {len(train_loader)}!")
                 print(f"  y_pred stats: min={y_pred.min().item():.3f}, max={y_pred.max().item():.3f}, "
                       f"mean={y_pred.mean().item():.3f}, std={y_pred.std().item():.3f}")
                 print(f"  y_true stats: min={y.min().item():.3f}, max={y.max().item():.3f}")
@@ -661,7 +661,7 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             ema.apply_shadow()
             torch.save(model.state_dict(), best_model_path)
             ema.restore()
-            output_str += " ✓ Best"
+            output_str += " [Best]"
         else:
             patience_counter += 1
             output_str += f" ({patience_counter}/{patience})"
@@ -691,7 +691,7 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     else:
         # If no best model, use final EMA model
         ema.apply_shadow()
-        print(f"\n⚠️ No best model saved, using final EMA model")
+        print(f"\n[WARNING] No best model saved, using final EMA model")
     
     # Save training history
     import pandas as pd
@@ -1518,7 +1518,7 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
         n_active = (~inactive_basis_mask).sum()
         
         # Show detailed statistics
-        print(f"\n  📊 Sparsity Analysis ({sparsity_type} penalty):")
+        print(f"\n  [INFO] Sparsity Analysis ({sparsity_type} penalty):")
         print(f"     Active basis: {n_active}/{len(inactive_basis_mask)}")
         print(f"     Removed basis: {n_inactive}/{len(inactive_basis_mask)} (norm < {threshold:.4f})")
         print(f"     Basis norms: min={basis_norms.min():.4f}, max={basis_norms.max():.4f}, "
@@ -1628,11 +1628,11 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
     # Update title with sparsity info
     title_suffix = ' (LEARNED)' if learnable else ' (FIXED - same as initial)'
     if learnable and out_of_domain > 0:
-        title_suffix += f'\n⚠️ {out_of_domain} centers out-of-domain'
+        title_suffix += f'\n[WARNING] {out_of_domain} centers out-of-domain'
     if inactive_basis_mask is not None:
         n_inactive = inactive_basis_mask.sum()
         n_active = (~inactive_basis_mask).sum()
-        title_suffix += f'\n🎯 {n_active} active, {n_inactive} removed (sparsity)'
+        title_suffix += f'\n[INFO] {n_active} active, {n_inactive} removed (sparsity)'
     
     ax.set_title(f'Final Basis Centers{title_suffix}', fontsize=20, fontweight='bold')
     ax.set_xlabel('x', fontsize=18)
@@ -1825,7 +1825,7 @@ def run_single_experiment(config: dict, experiment_id: int, output_dir: Path, de
                 q_result_file = q_output_dir / 'results.json'
                 if q_result_file.exists():
                     if verbose:
-                        print(f"✓ Quantile {q_level} already completed, loading...")
+                        print(f"[OK] Quantile {q_level} already completed, loading...")
                     with open(q_result_file, 'r') as f:
                         quantile_results[q_level] = json.load(f)
                     
@@ -2105,11 +2105,11 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         old_batch_size = batch_size
         batch_size = batch_size // 2
         batches_per_epoch = n_train_samples / batch_size
-        print(f"⚠️ Batch size {old_batch_size} would result in {n_train_samples / old_batch_size:.1f} batches/epoch")
+        print(f"[WARNING] Batch size {old_batch_size} would result in {n_train_samples / old_batch_size:.1f} batches/epoch")
         print(f"   Reducing to {batch_size} → {batches_per_epoch:.1f} batches/epoch")
     
     if batch_size != config.get('batch_size', 256):
-        print(f"✓ Final train batch size: {batch_size} ({n_train_samples / batch_size:.1f} batches/epoch)")
+        print(f"[OK] Final train batch size: {batch_size} ({n_train_samples / batch_size:.1f} batches/epoch)")
     
     # For validation/test, use larger batch size (no gradient computation needed)
     # Use 4x train batch size or all data at once, whichever is smaller
@@ -2962,7 +2962,7 @@ def main():
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
                 devnull.close()
-                print(f"\n❌ Experiment {exp_id} FAILED: {str(e)[:100]}")
+                print(f"\n[ERROR] Experiment {exp_id} FAILED: {str(e)[:100]}")
                 import traceback
                 traceback.print_exc()
                 return None
@@ -3000,7 +3000,7 @@ def main():
                                               verbose=True, parallel_mode=False, skip_existing=skip_existing)
                 all_results.append(results)
             except Exception as e:
-                print(f"\n❌ Experiment {i} FAILED with error: {e}")
+                print(f"\n[ERROR] Experiment {i} FAILED with error: {e}")
                 import traceback
                 traceback.print_exc()
                 continue

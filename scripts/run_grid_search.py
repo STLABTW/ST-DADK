@@ -1,7 +1,7 @@
 """
 Grid Search Experiment Runner
 
-모든 하이퍼파라미터 조합에 대해 실험을 수행하고 결과를 CSV로 저장합니다.
+Performs experiments for all hyperparameter combinations and saves results to CSV.
 """
 import argparse
 import yaml
@@ -155,7 +155,7 @@ def save_experiment_results(all_results, output_dir):
     df_summary = pd.DataFrame(summary_records)
     summary_file = output_dir / 'grid_search_summary.csv'
     df_summary.to_csv(summary_file, index=False)
-    print(f"\n✓ Summary saved: {summary_file}")
+    print(f"\n[OK] Summary saved: {summary_file}")
     
     # 2. Detailed results per iteration
     detail_records = []
@@ -207,7 +207,7 @@ def save_experiment_results(all_results, output_dir):
     df_detail = pd.DataFrame(detail_records)
     detail_file = output_dir / 'grid_search_detail.csv'
     df_detail.to_csv(detail_file, index=False)
-    print(f"✓ Detailed results saved: {detail_file}")
+    print(f"[OK] Detailed results saved: {detail_file}")
     
     # 3. Save configuration information
     config_records = []
@@ -226,13 +226,13 @@ def save_experiment_results(all_results, output_dir):
     config_json_file = output_dir / 'grid_search_configs.json'
     with open(config_json_file, 'w', encoding='utf-8') as f:
         json.dump(configs_dict, f, indent=2, ensure_ascii=False)
-    print(f"✓ Configurations saved: {config_json_file}")
+    print(f"[OK] Configurations saved: {config_json_file}")
     
     # Also save a simple CSV with just IDs and tags
     df_configs = pd.DataFrame(config_records)
     config_file = output_dir / 'grid_search_configs.csv'
     df_configs.to_csv(config_file, index=False)
-    print(f"✓ Configuration index saved: {config_file}")
+    print(f"[OK] Configuration index saved: {config_file}")
     
     return df_summary, df_detail
 
@@ -417,10 +417,10 @@ def main():
                     'status': 'success'
                 })
                 
-                print(f"\n✓ Config {i}/{n_configs} completed")
+                print(f"\n[OK] Config {i}/{n_configs} completed")
                 
             except Exception as e:
-                print(f"\n✗ Config {i}/{n_configs} FAILED: {e}")
+                print(f"\n[FAILED] Config {i}/{n_configs} FAILED: {e}")
                 import traceback
                 traceback.print_exc()
                 
@@ -473,12 +473,12 @@ def main():
             )
             
             if result.returncode == 0:
-                print("\n✓ Analysis completed successfully!")
+                print("\n[OK] Analysis completed successfully!")
             else:
-                print(f"\n✗ Analysis failed with return code: {result.returncode}")
+                print(f"\n[FAILED] Analysis failed with return code: {result.returncode}")
                 
         except Exception as e:
-            print(f"\n✗ Analysis failed: {e}")
+            print(f"\n[FAILED] Analysis failed: {e}")
             print("You can run analysis manually with:")
             print(f"  python scripts/analyze_grid_search.py --results_dir {output_dir}")
     

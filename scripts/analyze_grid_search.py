@@ -30,7 +30,7 @@ def regenerate_top_level_summaries(results_dir):
     config_yaml_paths = list(results_path.rglob('config.yaml'))
     
     if not config_yaml_paths:
-        print("❌ No config.yaml files found")
+        print("[ERROR] No config.yaml files found")
         return
     
     # Get directories containing config.yaml and summary/
@@ -44,7 +44,7 @@ def regenerate_top_level_summaries(results_dir):
     target_dirs = sorted(target_dirs)
     
     if not target_dirs:
-        print("❌ No valid config directories with summary files found")
+        print("[ERROR] No valid config directories with summary files found")
         return
     
     print(f"Regenerating top-level summaries from {len(target_dirs)} configs...")
@@ -133,21 +133,21 @@ def regenerate_top_level_summaries(results_dir):
     df_summary = df_summary.sort_values('config_id')
     summary_file = results_path / 'grid_search_summary.csv'
     df_summary.to_csv(summary_file, index=False)
-    print(f"✓ Updated: grid_search_summary.csv ({len(df_summary)} configs)")
+    print(f"[OK] Updated: grid_search_summary.csv ({len(df_summary)} configs)")
     
     # Save grid_search_detail.csv
     df_detail = pd.DataFrame(detail_records)
     df_detail = df_detail.sort_values(['config_id', 'experiment_id'])
     detail_file = results_path / 'grid_search_detail.csv'
     df_detail.to_csv(detail_file, index=False)
-    print(f"✓ Updated: grid_search_detail.csv ({len(df_detail)} experiments)")
+    print(f"[OK] Updated: grid_search_detail.csv ({len(df_detail)} experiments)")
     
     # Save grid_search_configs.json
     configs_dict = {str(cfg.get('config_id', 0)): cfg for cfg in all_configs}
     config_json_file = results_path / 'grid_search_configs.json'
     with open(config_json_file, 'w', encoding='utf-8') as f:
         json.dump(configs_dict, f, indent=2, ensure_ascii=False)
-    print(f"✓ Updated: grid_search_configs.json ({len(configs_dict)} configs)")
+    print(f"[OK] Updated: grid_search_configs.json ({len(configs_dict)} configs)")
     
     # Save grid_search_configs.csv (simple index)
     config_records = [{'config_id': cfg.get('config_id', 0), 'tag': cfg.get('tag', '')} 
@@ -156,7 +156,7 @@ def regenerate_top_level_summaries(results_dir):
     df_configs = df_configs.sort_values('config_id')
     config_file = results_path / 'grid_search_configs.csv'
     df_configs.to_csv(config_file, index=False)
-    print(f"✓ Updated: grid_search_configs.csv ({len(df_configs)} configs)\n")
+    print(f"[OK] Updated: grid_search_configs.csv ({len(df_configs)} configs)\n")
 
 
 def regenerate_config_summaries(results_dir):
@@ -172,7 +172,7 @@ def regenerate_config_summaries(results_dir):
     config_yaml_paths = list(results_path.rglob('config.yaml'))
     
     if not config_yaml_paths:
-        print("❌ No config.yaml files found")
+        print("[ERROR] No config.yaml files found")
         return
     
     # Get directories containing config.yaml and experiments/
@@ -186,7 +186,7 @@ def regenerate_config_summaries(results_dir):
     target_dirs = sorted(target_dirs)
     
     if not target_dirs:
-        print("❌ No valid config directories with experiments/ found")
+        print("[ERROR] No valid config directories with experiments/ found")
         return
     
     print(f"Found {len(target_dirs)} config directories with experiments\n")
@@ -215,7 +215,7 @@ def regenerate_config_summaries(results_dir):
                         all_results.append(result)
             
             if not all_results:
-                print("❌ No results.json files found")
+                print("[ERROR] No results.json files found")
                 failed_count += 1
                 continue
             
@@ -345,19 +345,19 @@ def regenerate_config_summaries(results_dir):
             csv_file = summary_dir / 'all_experiments.csv'
             df.to_csv(csv_file, index=False)
             
-            print(f"✓ ({n_experiments} experiments)")
+            print(f"[OK] ({n_experiments} experiments)")
             success_count += 1
             
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"[ERROR] Error: {e}")
             failed_count += 1
             import traceback
             traceback.print_exc()
     
     print(f"\n{'='*80}")
     print(f"Summary regeneration complete:")
-    print(f"  ✓ Success: {success_count}")
-    print(f"  ✗ Failed: {failed_count}")
+    print(f"  [OK] Success: {success_count}")
+    print(f"  [FAILED] Failed: {failed_count}")
     print(f"{'='*80}")
 
 
@@ -484,7 +484,7 @@ def main():
     if args.grid_dir is None:
         latest_dir = get_latest_grid_search_dir()
         if latest_dir is None:
-            print("❌ No grid_search directories found in results/")
+            print("[ERROR] No grid_search directories found in results/")
             exit(1)
         results_dir = Path(latest_dir)
         print(f"Using latest grid_search directory: {results_dir}")
@@ -493,7 +493,7 @@ def main():
     
     # Load data
     if not results_dir.exists():
-        print(f"❌ Grid directory not found: {results_dir}")
+        print(f"[ERROR] Grid directory not found: {results_dir}")
         exit(1)
     
     # ========================================================================
@@ -529,7 +529,7 @@ def main():
     
     detail_csv = results_dir / 'grid_search_detail.csv'
     if not detail_csv.exists():
-        print(f"❌ grid_search_detail.csv not found in {results_dir}")
+        print(f"[ERROR] grid_search_detail.csv not found in {results_dir}")
         exit(1)
     
     print(f"Analyzing: {results_dir}\n")
@@ -548,7 +548,7 @@ def main():
     # Identify varying parameters
     varying_params, param_values = identify_varying_parameters(df_detail)
     
-    print(f"📊 Identified varying parameters:")
+    print(f"[INFO] Identified varying parameters:")
     for param in varying_params:
         values = param_values[param]
         print(f"   - {param}: {values}")
@@ -563,7 +563,7 @@ def main():
     methods = sorted(df_detail['method'].unique())
     method_colors = assign_colors(methods)
     
-    print(f"🎨 Methods ({len(methods)}):")
+    print(f"[INFO] Methods ({len(methods)}):")
     for method in methods:
         print(f"   - {method}")
     print()
@@ -575,7 +575,7 @@ def main():
     # Get unique data files
     data_files = sorted(df_detail['data_file'].dropna().unique())
     
-    print(f"📁 Data files ({len(data_files)}):")
+    print(f"[INFO] Data files ({len(data_files)}):")
     for df_file in data_files:
         print(f"   - {df_file}")
     print()
@@ -603,7 +603,7 @@ def main():
         n_cols = len(obs_methods) * len(obs_ratios)
         
         if n_cols == 0 or n_rows == 0:
-            print(f"  ⚠️  No data to plot")
+            print(f"  [WARNING] No data to plot")
             continue
         
         # Create figure
@@ -689,13 +689,13 @@ def main():
         filename = data_file.replace('/', '_').replace('.csv', '.png')
         save_path = output_dir / filename
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"  ✓ Saved: {save_path}")
+        print(f"  [OK] Saved: {save_path}")
         plt.close()
         
         # ========================================================================
         # Generate aggregated plots (one parameter ignored at a time)
         # ========================================================================
-        print(f"  📊 Generating aggregated plots...")
+        print(f"  [INFO] Generating aggregated plots...")
         
         for param_to_ignore in varying_params:
             # Create aggregated method labels (without the ignored parameter)
@@ -788,7 +788,7 @@ def main():
             agg_filename = data_file.replace('/', '_').replace('.csv', f'_agg_no_{param_to_ignore}.png')
             save_path_agg = output_dir / agg_filename
             plt.savefig(save_path_agg, dpi=300, bbox_inches='tight')
-            print(f"     ✓ Aggregated plot (no {param_to_ignore}): {save_path_agg}")
+            print(f"     [OK] Aggregated plot (no {param_to_ignore}): {save_path_agg}")
             plt.close()
     
     # ========================================================================
@@ -836,7 +836,7 @@ def main():
     df_summary = pd.DataFrame(summary_stats)
     summary_file = output_dir / 'detailed_summary.csv'
     df_summary.to_csv(summary_file, index=False)
-    print(f"✓ Summary saved: {summary_file}")
+    print(f"[OK] Summary saved: {summary_file}")
     
     # ========================================================================
     # Key Insights
@@ -851,7 +851,7 @@ def main():
         if len(df_file_summary) == 0:
             continue
         
-        print(f"📊 {data_file}:")
+        print(f"[INFO] {data_file}:")
         
         # Best method overall
         best_idx = df_file_summary['rmse_mean'].idxmin()

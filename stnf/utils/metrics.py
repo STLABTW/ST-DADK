@@ -1,5 +1,5 @@
 """
-평가 지표 계산 유틸리티
+Evaluation metrics calculation utility
 """
 import numpy as np
 import torch
@@ -12,12 +12,12 @@ def compute_metrics(
     per_horizon: bool = False
 ) -> Dict[str, float]:
     """
-    회귀 평가 지표 계산 (RMSE, MAE, R²)
+    Calculate regression evaluation metrics (RMSE, MAE, R²)
     
     Args:
         y_true: Ground truth, shape (B, H, S, 1) or (N,)
         y_pred: Predictions, shape (B, H, S, 1) or (N,)
-        per_horizon: True면 허라이즌별 지표도 반환
+        per_horizon: If True, also return per-horizon metrics
         
     Returns:
         metrics: {'rmse': float, 'mae': float, 'r2': float, ...}
@@ -88,13 +88,13 @@ def compute_spatial_metrics(
     n_bins: int = 5
 ) -> Dict[str, list]:
     """
-    공간 영역별 성능 분석 (원점으로부터 거리 기준)
+    Performance analysis by spatial region (based on distance from origin)
     
     Args:
         y_true: Ground truth, shape (B, H, S, 1)
         y_pred: Predictions, shape (B, H, S, 1)
         coords: Site coordinates, shape (S, 2) with [x, y]
-        n_bins: 거리 구간 개수
+        n_bins: Number of distance bins
         
     Returns:
         spatial_metrics: {'distances': [...], 'rmse_by_dist': [...], ...}
@@ -148,11 +148,11 @@ def compute_spatial_metrics(
 
 def print_metrics(metrics: Dict[str, float], prefix: str = ""):
     """
-    지표를 보기 좋게 출력
+    Print metrics in a readable format
     
     Args:
-        metrics: compute_metrics의 출력
-        prefix: 출력 앞에 붙일 접두사 (예: "Train", "Val")
+        metrics: Output from compute_metrics
+        prefix: Prefix to add before output (e.g., "Train", "Val")
     """
     print(f"{prefix} Metrics:")
     print(f"  RMSE: {metrics['rmse']:.6f}")
