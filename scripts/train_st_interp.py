@@ -50,6 +50,41 @@ def quantile_loss(y_pred, y_true, quantile):
     return torch.mean(torch.max((quantile - 1) * errors, quantile * errors))
 
 
+def non_crossing_penalty(y_pred_multi_q: torch.Tensor, reduction: str = "mean", power: int = 1):
+    """
+    Penalize quantile crossing for multi-quantile outputs.
+
+    Given predicted quantiles \hat{q}_1, ..., \hat{q}_Q (in increasing tau order),
+    crossing happens when \hat{q}_k > \hat{q}_{k+1}. We penalize positive violations:
+
+        P_nc = sum_{k=1}^{Q-1} ReLU(\hat{q}_k - \hat{q}_{k+1})^power
+
+    Args:
+        y_pred_multi_q: (B, Q) predicted quantiles in increasing tau order
+        reduction: "mean" or "sum" over batch
+        power: 1 (hinge) or 2 (squared hinge)
+
+    Returns:
+        Scalar penalty tensor.
+    """
+    if y_pred_multi_q.dim() != 2 or y_pred_multi_q.shape[1] < 2:
+        return torch.tensor(0.0, device=y_pred_multi_q.device)
+
+    diffs = y_pred_multi_q[:, :-1] - y_pred_multi_q[:, 1:]  # (B, Q-1)
+    violations = torch.relu(diffs)
+    if power == 2:
+        violations = violations ** 2
+    elif power != 1:
+        raise ValueError(f"Unsupported power={power}; use 1 or 2.")
+
+    per_sample = violations.sum(dim=1)  # (B,)
+    if reduction == "mean":
+        return per_sample.mean()
+    if reduction == "sum":
+        return per_sample.sum()
+    raise ValueError(f"Unsupported reduction='{reduction}'; use 'mean' or 'sum'.")
+
+
 def compute_crps(predictions_dict, y_true):
     """
     Compute Continuous Ranked Probability Score (CRPS) from quantile predictions
@@ -502,6 +537,13 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     q_pred = y_pred[:, q_idx:q_idx+1]
                     losses.append(quantile_loss(q_pred, y, q_level))
                 loss = torch.mean(torch.stack(losses))
+
+                # Optional non-crossing penalty (enforces monotone predicted quantiles)
+                non_crossing_weight = config.get('non_crossing_weight', 0.0)
+                if non_crossing_weight > 0:
+                    nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
+                    nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
+                    loss = loss + non_crossing_weight * nc_penalty
             
             # Add regularization penalties for learnable basis centers
             if config.get('spatial_learnable', False):
@@ -609,6 +651,13 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                         q_pred = y_pred[:, q_idx:q_idx+1]
                         losses.append(quantile_loss(q_pred, y, q_level))
                     loss = torch.mean(torch.stack(losses))
+
+                    # Keep validation objective consistent with training objective
+                    non_crossing_weight = config.get('non_crossing_weight', 0.0)
+                    if non_crossing_weight > 0:
+                        nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
+                        nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
+                        loss = loss + non_crossing_weight * nc_penalty
                 
                 val_loss += loss.item()
                 
