@@ -30,6 +30,10 @@ sparsity_apply_to_spatial: true       # Apply sparsity penalty to spatial basis 
 sparsity_apply_to_temporal: false     # Apply sparsity penalty to temporal basis connections
 sparsity_threshold_ratio: 0.01        # Threshold for "removed" basis = ratio × max_norm (1e-2 = 1% of max)
 
+# Non-crossing penalty settings (for multi-quantile regression only)
+# non_crossing_weight: 0.1            # Penalty weight (0.0 = off, 0.1-1.0 recommended to start)
+# non_crossing_power: 1               # Penalty power: 1 (L1) or 2 (L2) - L1 often works better
+
 hidden_dims: [256, 256, 128]          # MLP hidden layer dimensions
 dropout: 0.1                          # Dropout rate
 layernorm: true                       # Use LayerNorm
