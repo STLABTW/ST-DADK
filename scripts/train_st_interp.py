@@ -150,61 +150,88 @@ def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
     return penalty
 
 
-def compute_crps(predictions_dict, y_true):
+def check_loss_numpy(y_pred, y_true, quantile):
+    """
+    Compute quantile (check) loss using numpy (for CRPS computation).
+    
+    Args:
+        y_pred: predicted values (N,)
+        y_true: true values (N,)
+        quantile: target quantile level (e.g., 0.1, 0.5, 0.9)
+    
+    Returns:
+        Mean check loss (scalar)
+    """
+    errors = y_true - y_pred
+    return np.mean(np.maximum((quantile - 1) * errors, quantile * errors))
+
+
+def compute_crps(predictions_dict, y_true, weights=None):
     """
     Compute Continuous Ranked Probability Score (CRPS) from quantile predictions
+    using Equation 4.6 from the thesis.
+    
+    CRPS(F, y) = 2 * Σ_k w_k ρ_{τ_k}(y - Q_{τ_k})
+    
+    where:
+    - ρ_{τ_k} is the check loss (quantile loss)
+    - w_k are quadrature weights (default: uniform weights, w_k = 1/K)
+    - 2× scaling factor as per Equation 4.6
     
     Args:
         predictions_dict: dict of {quantile_level: predictions (N,)}
         y_true: true values (N,)
+        weights: optional array of quadrature weights (default: uniform weights)
+                 If None, uses uniform weights w_k = 1/K where K is number of quantiles.
     
     Returns:
         CRPS score (lower is better)
     """
     # Sort quantiles
     quantiles = sorted(predictions_dict.keys())
+    K = len(quantiles)
     
-    if len(quantiles) == 1:
-        # Single quantile: use absolute error
+    if K == 0:
+        raise ValueError("predictions_dict cannot be empty")
+    
+    if K == 1:
+        # Single quantile: use check loss with 2× scaling
         q = quantiles[0]
-        return np.mean(np.abs(predictions_dict[q] - y_true))
+        check_loss = check_loss_numpy(predictions_dict[q], y_true, q)
+        return 2.0 * check_loss
     
-    # Multiple quantiles: approximate CRPS using trapezoidal rule
-    crps = 0.0
-    n_samples = len(y_true)
+    # Use uniform weights if not provided (as per thesis Section 4.2.2)
+    if weights is None:
+        weights = np.ones(K) / K  # Uniform weights: w_k = 1/K
+    else:
+        weights = np.asarray(weights)
+        if len(weights) != K:
+            raise ValueError(f"weights length ({len(weights)}) must match number of quantiles ({K})")
+        # Normalize weights to sum to 1
+        weights = weights / weights.sum()
     
-    for i in range(len(quantiles) - 1):
-        q1, q2 = quantiles[i], quantiles[i + 1]
-        pred1 = predictions_dict[q1]
-        pred2 = predictions_dict[q2]
-        
-        # Indicator: 1 if y_true < predicted quantile
-        indicator1 = (y_true < pred1).astype(float)
-        indicator2 = (y_true < pred2).astype(float)
-        
-        # Integrate using trapezoidal rule
-        weight = q2 - q1
-        crps += weight * np.mean(
-            (indicator1 - q1) * pred1 + (indicator2 - q2) * pred2
-        ) / 2.0
+    # Compute CRPS using Equation 4.6: CRPS(F, y) = 2 * Σ_k w_k ρ_{τ_k}(y - Q_{τ_k})
+    crps_sum = 0.0
+    for i, q in enumerate(quantiles):
+        pred = predictions_dict[q]
+        check_loss_q = check_loss_numpy(pred, y_true, q)
+        crps_sum += weights[i] * check_loss_q
     
-    # Alternative simpler approximation
-    crps_simple = 0.0
-    for q, pred in predictions_dict.items():
-        indicator = (y_true < pred).astype(float)
-        crps_simple += np.mean(np.abs(indicator - q) * np.abs(pred - y_true))
+    # Apply 2× scaling factor as per Equation 4.6
+    crps = 2.0 * crps_sum
     
-    return crps_simple / len(quantiles)
+    return crps
 
 
-def compute_crps_multi_quantile(preds, y_true, quantile_levels):
+def compute_crps_multi_quantile(preds, y_true, quantile_levels, weights=None):
     """
-    Compute CRPS for multi-quantile model output
+    Compute CRPS for multi-quantile model output using Equation 4.6.
     
     Args:
         preds: predictions array (N, Q) where Q is number of quantiles
         y_true: true values (N,) or (N, 1)
         quantile_levels: list of quantile levels [q1, q2, ..., qQ]
+        weights: optional array of quadrature weights (default: uniform weights)
     
     Returns:
         CRPS score (lower is better)
@@ -218,7 +245,7 @@ def compute_crps_multi_quantile(preds, y_true, quantile_levels):
     for i, q in enumerate(quantile_levels):
         predictions_dict[q] = preds[:, i]
     
-    return compute_crps(predictions_dict, y_true)
+    return compute_crps(predictions_dict, y_true, weights=weights)
 
 
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
