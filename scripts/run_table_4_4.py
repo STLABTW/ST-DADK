@@ -24,7 +24,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 from scripts.train_st_interp import run_single_experiment
 
 
-def create_table_4_4_configs(base_config_path: str, da_stdk_init_method_override: str = None):
+def create_table_4_4_configs(
+    base_config_path: str,
+    da_stdk_init_method_override: str = None,
+    non_crossing_lambda_override: float = None
+):
     """
     Create configurations for Table 4.4 scenarios
     
@@ -43,11 +47,13 @@ def create_table_4_4_configs(base_config_path: str, da_stdk_init_method_override
     
     # Force thesis-specific non-crossing setup (Section 4.2.2)
     # ASSUMPTION: Table 4.4 uses δ reparameterization with P_nc(δ) penalty as per Equation 3.9.
-    # We explicitly set these values rather than inheriting from base config to ensure
-    # reproducibility and match the thesis setup exactly.
-    # If base config has different defaults, this override ensures consistency.
+    # We explicitly set use_delta_reparameterization=True to ensure reproducibility.
+    # non_crossing_lambda can be set via CLI, base config, or defaults to 1.0.
     base_config['use_delta_reparameterization'] = True
-    base_config['non_crossing_lambda'] = 1.0  # P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
+    if non_crossing_lambda_override is not None:
+        base_config['non_crossing_lambda'] = non_crossing_lambda_override
+    elif 'non_crossing_lambda' not in base_config or base_config.get('non_crossing_lambda') is None:
+        base_config['non_crossing_lambda'] = 1.0  # Default P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
     
     # Define 4 scenarios
     scenarios = [
@@ -135,7 +141,8 @@ def run_table_4_4_experiments(
     verbose: bool = True,
     parallel_mode: bool = False,
     skip_existing: bool = False,
-    da_stdk_init_method: str = None
+    da_stdk_init_method: str = None,
+    non_crossing_lambda: float = None
 ):
     """
     Run all Table 4.4 experiments
@@ -150,6 +157,8 @@ def run_table_4_4_experiments(
         skip_existing: If True, skip experiments that already have results
         da_stdk_init_method: Override DA-STDK initialization method ('kmeans_balanced' or 'gmm').
                             If None, auto-detects based on k_means_constrained availability.
+        non_crossing_lambda: Override non_crossing_lambda (P_nc(δ) penalty weight).
+                            If None, uses value from base config or defaults to 1.0.
     """
     # Set device
     if device is None:
@@ -163,7 +172,12 @@ def run_table_4_4_experiments(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Generate configurations
-    configs = create_table_4_4_configs(base_config_path, da_stdk_init_method_override=da_stdk_init_method)
+    # Pass overrides if provided
+    configs = create_table_4_4_configs(
+        base_config_path,
+        da_stdk_init_method_override=da_stdk_init_method,
+        non_crossing_lambda_override=non_crossing_lambda
+    )
     
     print("="*80)
     print("TABLE 4.4 RUNNER: CRPS Comparison between STDK and DA-STDK")
@@ -338,6 +352,12 @@ def main():
         choices=['kmeans_balanced', 'gmm'],
         help='Override DA-STDK initialization method (default: auto-detect based on k_means_constrained availability)'
     )
+    parser.add_argument(
+        '--non_crossing_lambda',
+        type=float,
+        default=None,
+        help='Override non_crossing_lambda (P_nc(δ) penalty weight). If not set, uses base config value or defaults to 1.0'
+    )
     
     args = parser.parse_args()
     
@@ -349,7 +369,8 @@ def main():
         verbose=not args.quiet,
         parallel_mode=args.parallel,
         skip_existing=args.skip_existing,
-        da_stdk_init_method=args.da_stdk_init_method
+        da_stdk_init_method=args.da_stdk_init_method,
+        non_crossing_lambda=args.non_crossing_lambda
     )
 
 
