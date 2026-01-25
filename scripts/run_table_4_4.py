@@ -24,7 +24,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from scripts.train_st_interp import run_single_experiment
 
 
-def create_table_4_4_configs(base_config_path: str):
+def create_table_4_4_configs(base_config_path: str, da_stdk_init_method_override: str = None):
     """
     Create configurations for Table 4.4 scenarios
     
@@ -42,7 +42,10 @@ def create_table_4_4_configs(base_config_path: str):
     base_config['obs_ratio'] = 0.1  # 10% observation ratio (typical for experiments)
     
     # Force thesis-specific non-crossing setup (Section 4.2.2)
-    # Use δ reparameterization with P_nc(δ) penalty as per Equation 3.9
+    # ASSUMPTION: Table 4.4 uses δ reparameterization with P_nc(δ) penalty as per Equation 3.9.
+    # We explicitly set these values rather than inheriting from base config to ensure
+    # reproducibility and match the thesis setup exactly.
+    # If base config has different defaults, this override ensures consistency.
     base_config['use_delta_reparameterization'] = True
     base_config['non_crossing_lambda'] = 1.0  # P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
     
@@ -70,13 +73,25 @@ def create_table_4_4_configs(base_config_path: str):
         }
     ]
     
-    # Check if k_means_constrained is available for DA-STDK initialization
-    try:
-        import k_means_constrained
-        da_stdk_init_method = 'kmeans_balanced'
-    except ImportError:
-        print("Warning: k_means_constrained not available. Using 'gmm' for DA-STDK initialization.")
-        da_stdk_init_method = 'gmm'
+    # Determine DA-STDK initialization method
+    # ASSUMPTION: kmeans_balanced is preferred for DA-STDK (density-adaptive via equal coverage),
+    # but we fallback to 'gmm' if k_means_constrained is not available.
+    # This can be overridden via CLI argument (--da_stdk_init_method) or base config
+    # (table_4_4_da_stdk_init_method) if needed.
+    # Note: The thesis doesn't explicitly specify which method was used, but kmeans_balanced
+    # is mentioned in the codebase as a practical default for data-adaptive initialization.
+    if da_stdk_init_method_override is not None:
+        da_stdk_init_method = da_stdk_init_method_override
+    elif base_config.get('table_4_4_da_stdk_init_method') is not None:
+        da_stdk_init_method = base_config['table_4_4_da_stdk_init_method']
+    else:
+        # Auto-detect: prefer kmeans_balanced if available, else fallback to gmm
+        try:
+            import k_means_constrained
+            da_stdk_init_method = 'kmeans_balanced'
+        except ImportError:
+            print("Warning: k_means_constrained not available. Using 'gmm' for DA-STDK initialization.")
+            da_stdk_init_method = 'gmm'
     
     # Define 2 models
     models = [
@@ -119,7 +134,8 @@ def run_table_4_4_experiments(
     device: str = None,
     verbose: bool = True,
     parallel_mode: bool = False,
-    skip_existing: bool = False
+    skip_existing: bool = False,
+    da_stdk_init_method: str = None
 ):
     """
     Run all Table 4.4 experiments
@@ -132,6 +148,8 @@ def run_table_4_4_experiments(
         verbose: Whether to print detailed logs
         parallel_mode: Whether running in parallel mode
         skip_existing: If True, skip experiments that already have results
+        da_stdk_init_method: Override DA-STDK initialization method ('kmeans_balanced' or 'gmm').
+                            If None, auto-detects based on k_means_constrained availability.
     """
     # Set device
     if device is None:
@@ -145,7 +163,7 @@ def run_table_4_4_experiments(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Generate configurations
-    configs = create_table_4_4_configs(base_config_path)
+    configs = create_table_4_4_configs(base_config_path, da_stdk_init_method_override=da_stdk_init_method)
     
     print("="*80)
     print("TABLE 4.4 RUNNER: CRPS Comparison between STDK and DA-STDK")
@@ -313,6 +331,13 @@ def main():
         action='store_true',
         help='Skip experiments that already have results'
     )
+    parser.add_argument(
+        '--da_stdk_init_method',
+        type=str,
+        default=None,
+        choices=['kmeans_balanced', 'gmm'],
+        help='Override DA-STDK initialization method (default: auto-detect based on k_means_constrained availability)'
+    )
     
     args = parser.parse_args()
     
@@ -323,7 +348,8 @@ def main():
         device=args.device,
         verbose=not args.quiet,
         parallel_mode=args.parallel,
-        skip_existing=args.skip_existing
+        skip_existing=args.skip_existing,
+        da_stdk_init_method=args.da_stdk_init_method
     )
 
 
