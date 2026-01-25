@@ -749,7 +749,11 @@ class STInterpMLP(nn.Module):
             }
         
         # Get first layer weight matrix
-        first_layer = self.mlp[0]  # First Linear layer
+        # In δ reparameterization mode, use mlp_trunk; otherwise use mlp
+        if self.use_delta_reparameterization and self.mlp_trunk is not None:
+            first_layer = self.mlp_trunk[0]  # First Linear layer in shared trunk
+        else:
+            first_layer = self.mlp[0]  # First Linear layer
         weight = first_layer.weight  # (hidden_dim, input_dim)
         
         # Split weight matrix by input features: [X, φ(s), ψ(t)]

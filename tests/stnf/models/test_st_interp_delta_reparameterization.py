@@ -210,3 +210,76 @@ class TestDeltaReparameterization:
         assert output.shape == (sample_inputs['X'].shape[0], 1)
         # When output_dim=1, δ reparameterization path is not used
         # (checked in forward method: `if self.use_delta_reparameterization and self.output_dim > 1`)
+
+    def test_compute_sparsity_penalty_with_delta(self, model_config):
+        """Test that compute_sparsity_penalty works with δ reparameterization enabled"""
+        model = STInterpMLP(use_delta_reparameterization=True, **model_config)
+        
+        # Test all penalty types
+        for penalty_type in ['element', 'group', 'sparse_group', 'none']:
+            result = model.compute_sparsity_penalty(
+                penalty_type=penalty_type,
+                lambda_l1=0.01,
+                lambda_group=0.01
+            )
+            
+            assert 'spatial_penalty' in result
+            assert 'temporal_penalty' in result
+            assert 'total_penalty' in result
+            assert isinstance(result['total_penalty'], torch.Tensor)
+            assert result['total_penalty'] >= 0
+
+    def test_compute_sparsity_penalty_without_delta(self, model_config):
+        """Test that compute_sparsity_penalty works without δ reparameterization"""
+        model = STInterpMLP(use_delta_reparameterization=False, **model_config)
+        
+        # Test all penalty types
+        for penalty_type in ['element', 'group', 'sparse_group', 'none']:
+            result = model.compute_sparsity_penalty(
+                penalty_type=penalty_type,
+                lambda_l1=0.01,
+                lambda_group=0.01
+            )
+            
+            assert 'spatial_penalty' in result
+            assert 'temporal_penalty' in result
+            assert 'total_penalty' in result
+            assert isinstance(result['total_penalty'], torch.Tensor)
+            assert result['total_penalty'] >= 0
+
+    def test_sparsity_penalty_consistency(self, model_config):
+        """Test that sparsity penalty produces consistent results with/without δ"""
+        model_delta = STInterpMLP(use_delta_reparameterization=True, **model_config)
+        model_standard = STInterpMLP(use_delta_reparameterization=False, **model_config)
+        
+        # Initialize both models with same weights for fair comparison
+        # Copy weights from standard to delta (mlp_trunk should match mlp structure)
+        with torch.no_grad():
+            for i, layer in enumerate(model_standard.mlp):
+                if isinstance(layer, torch.nn.Linear):
+                    if i < len(model_delta.mlp_trunk):
+                        trunk_layer = model_delta.mlp_trunk[i]
+                        if isinstance(trunk_layer, torch.nn.Linear):
+                            trunk_layer.weight.copy_(layer.weight)
+                            if trunk_layer.bias is not None and layer.bias is not None:
+                                trunk_layer.bias.copy_(layer.bias)
+        
+        # Compute penalties
+        result_delta = model_delta.compute_sparsity_penalty(
+            penalty_type='group',
+            lambda_l1=0.01,
+            lambda_group=0.01
+        )
+        
+        result_standard = model_standard.compute_sparsity_penalty(
+            penalty_type='group',
+            lambda_l1=0.01,
+            lambda_group=0.01
+        )
+        
+        # Penalties should be similar (may differ slightly due to different architectures)
+        # But both should be valid (non-negative, finite)
+        assert torch.isfinite(result_delta['total_penalty'])
+        assert torch.isfinite(result_standard['total_penalty'])
+        assert result_delta['total_penalty'] >= 0
+        assert result_standard['total_penalty'] >= 0

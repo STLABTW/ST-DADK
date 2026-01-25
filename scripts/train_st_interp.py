@@ -1541,7 +1541,11 @@ def plot_basis_evolution(model_initial, model_final, train_coords, output_dir, c
     sparsity_type = config.get('sparsity_penalty_type', 'none')
     if sparsity_type in ['group', 'sparse_group']:
         # Extract first layer weights for spatial basis
-        first_layer_weight = model_final.mlp[0].weight.data  # (hidden_dim, hidden_dim)
+        # In δ reparameterization mode, use mlp_trunk; otherwise use mlp
+        if hasattr(model_final, 'use_delta_reparameterization') and model_final.use_delta_reparameterization and model_final.mlp_trunk is not None:
+            first_layer_weight = model_final.mlp_trunk[0].weight.data  # (hidden_dim, input_dim)
+        else:
+            first_layer_weight = model_final.mlp[0].weight.data  # (hidden_dim, input_dim)
         
         # Get spatial basis weights
         p = config.get('p_covariates', 0)
