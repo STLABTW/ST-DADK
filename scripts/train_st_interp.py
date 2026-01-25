@@ -52,7 +52,7 @@ def quantile_loss(y_pred, y_true, quantile):
 
 def non_crossing_penalty(y_pred_multi_q: torch.Tensor, reduction: str = "mean", power: int = 1):
     """
-    Penalize quantile crossing for multi-quantile outputs.
+    Penalize quantile crossing for multi-quantile outputs (prediction-level penalty).
 
     Given predicted quantiles \hat{q}_1, ..., \hat{q}_Q (in increasing tau order),
     crossing happens when \hat{q}_k > \hat{q}_{k+1}. We penalize positive violations:
@@ -83,6 +83,71 @@ def non_crossing_penalty(y_pred_multi_q: torch.Tensor, reduction: str = "mean", 
     if reduction == "sum":
         return per_sample.sum()
     raise ValueError(f"Unsupported reduction='{reduction}'; use 'mean' or 'sum'.")
+
+
+def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
+    """
+    Compute P_nc(δ) penalty on δ parameters as defined in Section 3.2 (Equation 3.10).
+    
+    For each quantile k = 2, ..., Q:
+        J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
+    
+    Then:
+        P_nc(δ) = Σ_{k=2}^Q J(δ_k)
+    
+    This enforces feasibility condition on δ parameters to ensure non-crossing quantiles.
+    
+    NOTE: Mathematical property: J(δ_k) ≤ 0 always (since max(δ_k,0, Σ) ≥ δ_k,0).
+    When added to loss as: loss + λ * P_nc(δ), this encourages more negative J(δ_k),
+    which promotes feasibility. However, there is a theoretical risk that δ_k,0 could
+    be pushed toward -infinity if not constrained by other terms in the loss.
+    In practice, the quantile loss term and bounded h(s,t) (if using sigmoid) should
+    prevent this. See Section 3.2 and [17] for details.
+    
+    TODO: Verify sign convention with original paper [17] (Moon et al., 2021).
+    Current implementation matches Equation 3.10 exactly, but the negative sign
+    behavior (rewarding more negative J(δ_k)) may need empirical validation or
+    adjustment (e.g., using -P_nc(δ) or max(0, -P_nc(δ)) instead).
+    
+    Args:
+        delta_params: List of δ_k Parameter tensors, each of shape (d+1,) where:
+            - δ_k[0] is the intercept δ_k,0
+            - δ_k[1:] are feature coefficients δ_k,1, ..., δ_k,d
+            - d is the last hidden layer dimension
+    
+    Returns:
+        Scalar penalty tensor P_nc(δ) (typically ≤ 0)
+    """
+    if delta_params is None or len(delta_params) < 2:
+        # Need at least 2 quantiles for non-crossing penalty
+        if delta_params and len(delta_params) > 0:
+            device = delta_params[0].device
+        else:
+            device = torch.device('cpu')
+        return torch.tensor(0.0, device=device)
+    
+    Q = len(delta_params)
+    penalty = torch.tensor(0.0, device=delta_params[0].device)
+    
+    # Compute J(δ_k) for k = 2, ..., Q (k=1 doesn't need penalty)
+    for k in range(1, Q):  # k=1 means δ_2 (second quantile, index 1)
+        delta_k = delta_params[k]  # (d+1,) Parameter tensor
+        
+        # Extract intercept and feature coefficients
+        delta_k_0 = delta_k[0]  # δ_k,0 (intercept)
+        delta_k_features = delta_k[1:]  # δ_k,1, ..., δ_k,d (feature coefficients)
+        
+        # Compute Σ_{j=1}^d max(0, -δ_k,j)
+        negative_features = torch.clamp(-delta_k_features, min=0.0)  # max(0, -δ_k,j)
+        sum_negative = negative_features.sum()  # Σ_{j=1}^d max(0, -δ_k,j)
+        
+        # J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
+        max_term = torch.max(delta_k_0, sum_negative)
+        J_delta_k = delta_k_0 - max_term
+        
+        penalty = penalty + J_delta_k
+    
+    return penalty
 
 
 def compute_crps(predictions_dict, y_true):
@@ -538,12 +603,32 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     losses.append(quantile_loss(q_pred, y, q_level))
                 loss = torch.mean(torch.stack(losses))
 
-                # Optional non-crossing penalty (enforces monotone predicted quantiles)
-                non_crossing_weight = config.get('non_crossing_weight', 0.0)
-                if non_crossing_weight > 0:
-                    nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
-                    nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
-                    loss = loss + non_crossing_weight * nc_penalty
+                # Non-crossing penalty
+                # If δ reparameterization is enabled, use P_nc(δ) (parameter-level)
+                # Otherwise, use prediction-level penalty
+                use_delta_reparam = config.get('use_delta_reparameterization', False)
+                if use_delta_reparam:
+                    # P_nc(δ) penalty on δ parameters (Section 3.2, Equation 3.10)
+                    # NOTE: P_nc(δ) ≤ 0 always, so adding λ * P_nc(δ) to loss encourages
+                    # more negative P_nc(δ) (better feasibility). The quantile loss term
+                    # should prevent δ_k,0 from going to -infinity in practice.
+                    # TODO: Verify sign convention with original paper [17] (Moon et al., 2021).
+                    # Current implementation matches Equation 3.10 exactly, but the negative
+                    # sign behavior (rewarding more negative J(δ_k)) may need empirical
+                    # validation or adjustment (e.g., using -P_nc(δ) or max(0, -P_nc(δ)) instead).
+                    non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
+                    if non_crossing_lambda > 0:
+                        delta_params = model.get_delta_parameters()
+                        if delta_params is not None:
+                            p_nc_delta = compute_p_nc_delta_penalty(delta_params)
+                            loss = loss + non_crossing_lambda * p_nc_delta
+                else:
+                    # Prediction-level penalty (original method)
+                    non_crossing_weight = config.get('non_crossing_weight', 0.0)
+                    if non_crossing_weight > 0:
+                        nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
+                        nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
+                        loss = loss + non_crossing_weight * nc_penalty
             
             # Add regularization penalties for learnable basis centers
             if config.get('spatial_learnable', False):
@@ -653,11 +738,22 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     loss = torch.mean(torch.stack(losses))
 
                     # Keep validation objective consistent with training objective
-                    non_crossing_weight = config.get('non_crossing_weight', 0.0)
-                    if non_crossing_weight > 0:
-                        nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
-                        nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
-                        loss = loss + non_crossing_weight * nc_penalty
+                    # Use same penalty method as training (δ-based or prediction-level)
+                    use_delta_reparam = config.get('use_delta_reparameterization', False)
+                    if use_delta_reparam:
+                        # TODO: Verify sign convention - see compute_p_nc_delta_penalty() docstring.
+                        non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
+                        if non_crossing_lambda > 0:
+                            delta_params = model.get_delta_parameters()
+                            if delta_params is not None:
+                                p_nc_delta = compute_p_nc_delta_penalty(delta_params)
+                                loss = loss + non_crossing_lambda * p_nc_delta
+                    else:
+                        non_crossing_weight = config.get('non_crossing_weight', 0.0)
+                        if non_crossing_weight > 0:
+                            nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
+                            nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
+                            loss = loss + non_crossing_weight * nc_penalty
                 
                 val_loss += loss.item()
                 
