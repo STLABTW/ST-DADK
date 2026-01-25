@@ -283,3 +283,18 @@ class TestDeltaReparameterization:
         assert torch.isfinite(result_standard['total_penalty'])
         assert result_delta['total_penalty'] >= 0
         assert result_standard['total_penalty'] >= 0
+
+    # TODO: Add training integration test with δ reparameterization + sparsity penalties
+    # This should test the full training loop to ensure:
+    # 1. Training doesn't crash when both features are enabled
+    # 2. Loss computation includes both sparsity penalty and δ-based loss
+    # 3. Gradients flow correctly through both penalty terms
+    # 4. Model can complete at least a few training steps successfully
+    # Example test structure:
+    # def test_training_with_delta_and_sparsity(self, model_config, sample_inputs):
+    #     """Test full training loop with δ reparameterization and sparsity penalties"""
+    #     model = STInterpMLP(use_delta_reparameterization=True, **model_config)
+    #     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    #     # ... create dummy data loader ...
+    #     # ... run a few training steps with sparsity_penalty_type='sparse_group' ...
+    #     # ... verify no crashes and loss decreases ...
