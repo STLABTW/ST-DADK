@@ -41,6 +41,11 @@ def create_table_4_4_configs(base_config_path: str):
     base_config['quantile_levels'] = [0.05, 0.25, 0.5, 0.75, 0.95]
     base_config['obs_ratio'] = 0.1  # 10% observation ratio (typical for experiments)
     
+    # Force thesis-specific non-crossing setup (Section 4.2.2)
+    # Use δ reparameterization with P_nc(δ) penalty as per Equation 3.9
+    base_config['use_delta_reparameterization'] = True
+    base_config['non_crossing_lambda'] = 1.0  # P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
+    
     # Define 4 scenarios
     scenarios = [
         {
@@ -65,6 +70,14 @@ def create_table_4_4_configs(base_config_path: str):
         }
     ]
     
+    # Check if k_means_constrained is available for DA-STDK initialization
+    try:
+        import k_means_constrained
+        da_stdk_init_method = 'kmeans_balanced'
+    except ImportError:
+        print("Warning: k_means_constrained not available. Using 'gmm' for DA-STDK initialization.")
+        da_stdk_init_method = 'gmm'
+    
     # Define 2 models
     models = [
         {
@@ -74,7 +87,7 @@ def create_table_4_4_configs(base_config_path: str):
         },
         {
             'name': 'DA-STDK',
-            'spatial_init_method': 'kmeans_balanced',  # or 'gmm'
+            'spatial_init_method': da_stdk_init_method,  # 'kmeans_balanced' if available, else 'gmm'
             'spatial_learnable': True
         }
     ]
