@@ -104,6 +104,11 @@ def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
     In practice, the quantile loss term and bounded h(s,t) (if using sigmoid) should
     prevent this. See Section 3.2 and [17] for details.
     
+    TODO: Verify sign convention with original paper [17] (Moon et al., 2021).
+    Current implementation matches Equation 3.10 exactly, but the negative sign
+    behavior (rewarding more negative J(δ_k)) may need empirical validation or
+    adjustment (e.g., using -P_nc(δ) or max(0, -P_nc(δ)) instead).
+    
     Args:
         delta_params: List of δ_k Parameter tensors, each of shape (d+1,) where:
             - δ_k[0] is the intercept δ_k,0
@@ -607,6 +612,10 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     # NOTE: P_nc(δ) ≤ 0 always, so adding λ * P_nc(δ) to loss encourages
                     # more negative P_nc(δ) (better feasibility). The quantile loss term
                     # should prevent δ_k,0 from going to -infinity in practice.
+                    # TODO: Verify sign convention with original paper [17] (Moon et al., 2021).
+                    # Current implementation matches Equation 3.10 exactly, but the negative
+                    # sign behavior (rewarding more negative J(δ_k)) may need empirical
+                    # validation or adjustment (e.g., using -P_nc(δ) or max(0, -P_nc(δ)) instead).
                     non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
                     if non_crossing_lambda > 0:
                         delta_params = model.get_delta_parameters()
@@ -732,6 +741,7 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     # Use same penalty method as training (δ-based or prediction-level)
                     use_delta_reparam = config.get('use_delta_reparameterization', False)
                     if use_delta_reparam:
+                        # TODO: Verify sign convention - see compute_p_nc_delta_penalty() docstring.
                         non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
                         if non_crossing_lambda > 0:
                             delta_params = model.get_delta_parameters()
