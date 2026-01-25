@@ -30,6 +30,10 @@ sparsity_apply_to_spatial: true       # Apply sparsity penalty to spatial basis 
 sparsity_apply_to_temporal: false     # Apply sparsity penalty to temporal basis connections
 sparsity_threshold_ratio: 0.01        # Threshold for "removed" basis = ratio × max_norm (1e-2 = 1% of max)
 
+# Non-crossing penalty settings (for multi-quantile regression only)
+# non_crossing_weight: 0.1            # Penalty weight (0.0 = off, 0.1-1.0 recommended to start)
+# non_crossing_power: 1               # Penalty power: 1 (L1) or 2 (L2) - L1 often works better
+
 hidden_dims: [256, 256, 128]          # MLP hidden layer dimensions
 dropout: 0.1                          # Dropout rate
 layernorm: true                       # Use LayerNorm
@@ -67,6 +71,10 @@ num_workers: 0                    # DataLoader workers per experiment (set to 0 
 # Regression type
 regression_type: multi-quantile
 quantile_levels: [0.05, 0.25, 0.5, 0.75, 0.95]
+
+# δ reparameterization (Section 3.2)
+# When enabled, uses cumulative construction β_k = Σ δ_ℓ for non-crossing quantiles
+use_delta_reparameterization: false  # Set to true to enable δ reparameterization
 
 # Device
 device: cpu

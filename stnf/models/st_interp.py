@@ -620,7 +620,8 @@ class STInterpMLP(nn.Module):
                  gradient_damping: bool = False,
                  damping_threshold: float = 0.3,
                  damping_strength: float = 1.0,
-                 output_dim: int = 1):  # For multi-quantile: output_dim = number of quantiles
+                 output_dim: int = 1,  # For multi-quantile: output_dim = number of quantiles
+                 use_delta_reparameterization: bool = False):  # Enable δ reparameterization for multi-quantile
         super().__init__()
         
         self.p = p
@@ -628,6 +629,7 @@ class STInterpMLP(nn.Module):
         self.spatial_init_method = spatial_init_method
         self.spatial_basis_function = spatial_basis_function
         self.output_dim = output_dim
+        self.use_delta_reparameterization = use_delta_reparameterization
         
         # Spatial basis embedding
         self.spatial_basis = SpatialBasisEmbedding(
@@ -663,10 +665,31 @@ class STInterpMLP(nn.Module):
                 layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
         
-        # Output layer: output_dim outputs (1 for mean/single quantile, Q for multi-quantile)
-        layers.append(nn.Linear(prev_dim, self.output_dim))
+        # Store last hidden dimension for δ reparameterization
+        self.last_hidden_dim = prev_dim
         
-        self.mlp = nn.Sequential(*layers)
+        if use_delta_reparameterization and output_dim > 1:
+            # For δ reparameterization: shared trunk ends at last hidden layer
+            # We'll create per-quantile δ parameters and compute β_k = Σ δ_ℓ
+            self.mlp_trunk = nn.Sequential(*layers)  # Shared trunk (without output layer)
+            
+            # Initialize δ parameters: δ_k for k=1,...,Q
+            # Each δ_k is (d+1,) where d = last_hidden_dim
+            # δ_k = (δ_k,0, δ_k,1, ..., δ_k,d) where δ_k,0 is intercept
+            self.delta_params = nn.ParameterList([
+                nn.Parameter(torch.zeros(prev_dim + 1))  # (d+1,) for each quantile
+                for _ in range(output_dim)
+            ])
+            
+            # Initialize δ parameters with small random values
+            for delta_k in self.delta_params:
+                nn.init.normal_(delta_k, mean=0.0, std=0.01)
+        else:
+            # Standard output layer: output_dim outputs (1 for mean/single quantile, Q for multi-quantile)
+            layers.append(nn.Linear(prev_dim, self.output_dim))
+            self.mlp = nn.Sequential(*layers)
+            self.mlp_trunk = None
+            self.delta_params = None
     
     def compute_domain_penalty(self):
         """
@@ -685,6 +708,18 @@ class STInterpMLP(nn.Module):
             penalty: scalar tensor
         """
         return self.spatial_basis.compute_movement_penalty()
+    
+    def get_delta_parameters(self):
+        """
+        Get δ parameters for non-crossing penalty computation.
+        
+        Returns:
+            List of δ_k tensors, each of shape (d+1,) where d = last_hidden_dim.
+            Returns None if δ reparameterization is not enabled.
+        """
+        if not self.use_delta_reparameterization or self.delta_params is None:
+            return None
+        return list(self.delta_params)
     
     def compute_sparsity_penalty(self, penalty_type='element', lambda_l1=0.01, lambda_group=0.01):
         """
@@ -714,7 +749,11 @@ class STInterpMLP(nn.Module):
             }
         
         # Get first layer weight matrix
-        first_layer = self.mlp[0]  # First Linear layer
+        # In δ reparameterization mode, use mlp_trunk; otherwise use mlp
+        if self.use_delta_reparameterization and self.mlp_trunk is not None:
+            first_layer = self.mlp_trunk[0]  # First Linear layer in shared trunk
+        else:
+            first_layer = self.mlp[0]  # First Linear layer
         weight = first_layer.weight  # (hidden_dim, input_dim)
         
         # Split weight matrix by input features: [X, φ(s), ψ(t)]
@@ -791,7 +830,8 @@ class STInterpMLP(nn.Module):
         coords: (B, 2) or (N, 2) - spatial coordinates (x, y) normalized to [0,1]
         t: (B, 1) or (N, 1) - temporal coordinate normalized to [t_min, t_max]
         
-        Returns: (B, 1) or (N, 1) - predicted values ŷ(s,t)
+        Returns: (B, 1) or (N, 1) or (B, Q) or (N, Q) - predicted values ŷ(s,t)
+                 For multi-quantile with δ reparameterization: (B, Q) or (N, Q)
         """
         # Spatial basis embedding
         phi_s = self.spatial_basis(coords)  # (B, k_spatial) or (N, k_spatial)
@@ -805,8 +845,39 @@ class STInterpMLP(nn.Module):
         else:
             features = torch.cat([phi_s, psi_t], dim=-1)  # (B, k_s + k_t)
         
-        # MLP prediction
-        y_pred = self.mlp(features)  # (B, 1) or (N, 1)
+        # Forward through MLP
+        if self.use_delta_reparameterization and self.output_dim > 1:
+            # δ reparameterization path
+            # Get shared trunk output h(s,t)
+            h = self.mlp_trunk(features)  # (B, d) or (N, d) where d = last_hidden_dim
+            
+            # Compute quantile predictions using δ reparameterization
+            # For each quantile k: β_k = Σ_{ℓ=1}^k δ_ℓ, then Ŷ_τk = [1, h(s,t)ᵀ] β_k
+            batch_size = h.shape[0]
+            quantile_preds = []
+            
+            # Compute cumulative β_k = Σ_{ℓ=1}^k δ_ℓ for each quantile
+            beta_cumsum = torch.zeros(batch_size, self.last_hidden_dim + 1, device=h.device)
+            
+            for k in range(self.output_dim):
+                # Accumulate: β_k = β_{k-1} + δ_k (where β_0 = 0)
+                delta_k = self.delta_params[k]  # (d+1,)
+                beta_cumsum = beta_cumsum + delta_k.unsqueeze(0)  # (1, d+1) -> (B, d+1)
+                
+                # Extract intercept and feature coefficients from β_k
+                beta_k_intercept = beta_cumsum[:, 0:1]  # (B, 1)
+                beta_k_features = beta_cumsum[:, 1:]  # (B, d)
+                
+                # Compute Ŷ_τk = [1, h(s,t)ᵀ] β_k = β_k,0 + h(s,t)ᵀ β_k,1:d
+                # This is equivalent to: intercept + dot product of h with feature coefficients
+                y_pred_k = beta_k_intercept + torch.sum(h * beta_k_features, dim=1, keepdim=True)  # (B, 1)
+                quantile_preds.append(y_pred_k)
+            
+            # Stack all quantile predictions
+            y_pred = torch.cat(quantile_preds, dim=1)  # (B, Q) or (N, Q)
+        else:
+            # Standard path: direct MLP output
+            y_pred = self.mlp(features)  # (B, 1) or (N, 1) or (B, Q) or (N, Q)
         
         return y_pred
 
@@ -843,5 +914,6 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         gradient_damping=config.get('gradient_damping', False),
         damping_threshold=config.get('damping_threshold', 0.3),
         damping_strength=config.get('damping_strength', 1.0),
-        output_dim=output_dim
+        output_dim=output_dim,
+        use_delta_reparameterization=config.get('use_delta_reparameterization', False)
     )
