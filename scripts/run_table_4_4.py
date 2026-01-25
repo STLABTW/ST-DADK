@@ -44,6 +44,8 @@ def create_table_4_4_configs(
     base_config['regression_type'] = 'multi-quantile'
     base_config['quantile_levels'] = [0.05, 0.25, 0.5, 0.75, 0.95]
     base_config['obs_ratio'] = 0.1  # 10% observation ratio (typical for experiments)
+    # Force normalization to match paper scale (CRPS ~0.08-0.17 in paper vs ~3.3 without normalization)
+    base_config['normalize_target'] = True
     
     # Force thesis-specific non-crossing setup (Section 4.2.2)
     # ASSUMPTION: Table 4.4 uses δ reparameterization with P_nc(δ) penalty as per Equation 3.9.
