@@ -240,6 +240,9 @@ def run_table_4_4_experiments(
             experiment_counter += 1
             exp_output_dir = scenario_output_dir / f"exp_{exp_id:03d}"
             
+            # Create experiment output directory
+            exp_output_dir.mkdir(parents=True, exist_ok=True)
+            
             if skip_existing and (exp_output_dir / 'results.json').exists():
                 if verbose:
                     print(f"  Experiment {exp_id}/{n_experiments}: Skipping (already exists)")
