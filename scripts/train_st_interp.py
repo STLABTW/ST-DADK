@@ -97,6 +97,13 @@ def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
     
     This enforces feasibility condition on δ parameters to ensure non-crossing quantiles.
     
+    NOTE: Mathematical property: J(δ_k) ≤ 0 always (since max(δ_k,0, Σ) ≥ δ_k,0).
+    When added to loss as: loss + λ * P_nc(δ), this encourages more negative J(δ_k),
+    which promotes feasibility. However, there is a theoretical risk that δ_k,0 could
+    be pushed toward -infinity if not constrained by other terms in the loss.
+    In practice, the quantile loss term and bounded h(s,t) (if using sigmoid) should
+    prevent this. See Section 3.2 and [17] for details.
+    
     Args:
         delta_params: List of δ_k Parameter tensors, each of shape (d+1,) where:
             - δ_k[0] is the intercept δ_k,0
@@ -104,7 +111,7 @@ def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
             - d is the last hidden layer dimension
     
     Returns:
-        Scalar penalty tensor P_nc(δ)
+        Scalar penalty tensor P_nc(δ) (typically ≤ 0)
     """
     if delta_params is None or len(delta_params) < 2:
         # Need at least 2 quantiles for non-crossing penalty
@@ -597,6 +604,9 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 use_delta_reparam = config.get('use_delta_reparameterization', False)
                 if use_delta_reparam:
                     # P_nc(δ) penalty on δ parameters (Section 3.2, Equation 3.10)
+                    # NOTE: P_nc(δ) ≤ 0 always, so adding λ * P_nc(δ) to loss encourages
+                    # more negative P_nc(δ) (better feasibility). The quantile loss term
+                    # should prevent δ_k,0 from going to -infinity in practice.
                     non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
                     if non_crossing_lambda > 0:
                         delta_params = model.get_delta_parameters()
