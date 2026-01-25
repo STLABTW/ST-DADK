@@ -24,7 +24,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 from scripts.train_st_interp import run_single_experiment
 
 
-def create_table_4_4_configs(base_config_path: str):
+def create_table_4_4_configs(
+    base_config_path: str,
+    da_stdk_init_method_override: str = None,
+    non_crossing_lambda_override: float = None
+):
     """
     Create configurations for Table 4.4 scenarios
     
@@ -40,6 +44,16 @@ def create_table_4_4_configs(base_config_path: str):
     base_config['regression_type'] = 'multi-quantile'
     base_config['quantile_levels'] = [0.05, 0.25, 0.5, 0.75, 0.95]
     base_config['obs_ratio'] = 0.1  # 10% observation ratio (typical for experiments)
+    
+    # Force thesis-specific non-crossing setup (Section 4.2.2)
+    # ASSUMPTION: Table 4.4 uses δ reparameterization with P_nc(δ) penalty as per Equation 3.9.
+    # We explicitly set use_delta_reparameterization=True to ensure reproducibility.
+    # non_crossing_lambda can be set via CLI, base config, or defaults to 1.0.
+    base_config['use_delta_reparameterization'] = True
+    if non_crossing_lambda_override is not None:
+        base_config['non_crossing_lambda'] = non_crossing_lambda_override
+    elif 'non_crossing_lambda' not in base_config or base_config.get('non_crossing_lambda') is None:
+        base_config['non_crossing_lambda'] = 1.0  # Default P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
     
     # Define 4 scenarios
     scenarios = [
@@ -65,6 +79,26 @@ def create_table_4_4_configs(base_config_path: str):
         }
     ]
     
+    # Determine DA-STDK initialization method
+    # ASSUMPTION: kmeans_balanced is preferred for DA-STDK (density-adaptive via equal coverage),
+    # but we fallback to 'gmm' if k_means_constrained is not available.
+    # This can be overridden via CLI argument (--da_stdk_init_method) or base config
+    # (table_4_4_da_stdk_init_method) if needed.
+    # Note: The thesis doesn't explicitly specify which method was used, but kmeans_balanced
+    # is mentioned in the codebase as a practical default for data-adaptive initialization.
+    if da_stdk_init_method_override is not None:
+        da_stdk_init_method = da_stdk_init_method_override
+    elif base_config.get('table_4_4_da_stdk_init_method') is not None:
+        da_stdk_init_method = base_config['table_4_4_da_stdk_init_method']
+    else:
+        # Auto-detect: prefer kmeans_balanced if available, else fallback to gmm
+        try:
+            import k_means_constrained
+            da_stdk_init_method = 'kmeans_balanced'
+        except ImportError:
+            print("Warning: k_means_constrained not available. Using 'gmm' for DA-STDK initialization.")
+            da_stdk_init_method = 'gmm'
+    
     # Define 2 models
     models = [
         {
@@ -74,7 +108,7 @@ def create_table_4_4_configs(base_config_path: str):
         },
         {
             'name': 'DA-STDK',
-            'spatial_init_method': 'kmeans_balanced',  # or 'gmm'
+            'spatial_init_method': da_stdk_init_method,  # 'kmeans_balanced' if available, else 'gmm'
             'spatial_learnable': True
         }
     ]
@@ -106,7 +140,9 @@ def run_table_4_4_experiments(
     device: str = None,
     verbose: bool = True,
     parallel_mode: bool = False,
-    skip_existing: bool = False
+    skip_existing: bool = False,
+    da_stdk_init_method: str = None,
+    non_crossing_lambda: float = None
 ):
     """
     Run all Table 4.4 experiments
@@ -119,6 +155,10 @@ def run_table_4_4_experiments(
         verbose: Whether to print detailed logs
         parallel_mode: Whether running in parallel mode
         skip_existing: If True, skip experiments that already have results
+        da_stdk_init_method: Override DA-STDK initialization method ('kmeans_balanced' or 'gmm').
+                            If None, auto-detects based on k_means_constrained availability.
+        non_crossing_lambda: Override non_crossing_lambda (P_nc(δ) penalty weight).
+                            If None, uses value from base config or defaults to 1.0.
     """
     # Set device
     if device is None:
@@ -132,7 +172,12 @@ def run_table_4_4_experiments(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Generate configurations
-    configs = create_table_4_4_configs(base_config_path)
+    # Pass overrides if provided
+    configs = create_table_4_4_configs(
+        base_config_path,
+        da_stdk_init_method_override=da_stdk_init_method,
+        non_crossing_lambda_override=non_crossing_lambda
+    )
     
     print("="*80)
     print("TABLE 4.4 RUNNER: CRPS Comparison between STDK and DA-STDK")
@@ -300,6 +345,19 @@ def main():
         action='store_true',
         help='Skip experiments that already have results'
     )
+    parser.add_argument(
+        '--da_stdk_init_method',
+        type=str,
+        default=None,
+        choices=['kmeans_balanced', 'gmm'],
+        help='Override DA-STDK initialization method (default: auto-detect based on k_means_constrained availability)'
+    )
+    parser.add_argument(
+        '--non_crossing_lambda',
+        type=float,
+        default=None,
+        help='Override non_crossing_lambda (P_nc(δ) penalty weight). If not set, uses base config value or defaults to 1.0'
+    )
     
     args = parser.parse_args()
     
@@ -310,7 +368,9 @@ def main():
         device=args.device,
         verbose=not args.quiet,
         parallel_mode=args.parallel,
-        skip_existing=args.skip_existing
+        skip_existing=args.skip_existing,
+        da_stdk_init_method=args.da_stdk_init_method,
+        non_crossing_lambda=args.non_crossing_lambda
     )
 
 
