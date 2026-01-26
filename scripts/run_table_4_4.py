@@ -44,7 +44,17 @@ def create_table_4_4_configs(
     base_config['regression_type'] = 'multi-quantile'
     base_config['quantile_levels'] = [0.05, 0.25, 0.5, 0.75, 0.95]
     base_config['obs_ratio'] = 0.1  # 10% observation ratio (typical for experiments)
+
+    # Align with thesis settings (4.2.2) by disabling extra regularization
+    # that are not mentioned in the paper.
+    base_config['gradient_damping'] = False
+    base_config['domain_penalty_weight'] = 0.0
+    base_config['movement_penalty_weight'] = 0.0
+    base_config['sparsity_penalty_type'] = 'none'
+    
     # Force normalization to match paper scale (CRPS ~0.08-0.17 in paper vs ~3.3 without normalization)
+    # Note: Normalization is necessary to match paper's CRPS values. Without it, CRPS is ~3.3 (44x higher).
+    # With normalization based on observed data only, we get CRPS ~0.21 (close to paper's range).
     base_config['normalize_target'] = True
     
     # Force thesis-specific non-crossing setup (Section 4.2.2)
@@ -55,7 +65,7 @@ def create_table_4_4_configs(
     if non_crossing_lambda_override is not None:
         base_config['non_crossing_lambda'] = non_crossing_lambda_override
     elif 'non_crossing_lambda' not in base_config or base_config.get('non_crossing_lambda') is None:
-        base_config['non_crossing_lambda'] = 1.0  # Default P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
+        base_config['non_crossing_lambda'] = 1e-3  # Default P_nc(δ) penalty weight λ (Section 3.2, Eq. 3.9)
     
     # Define 4 scenarios
     scenarios = [
