@@ -2181,12 +2181,12 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     if verbose:
         print(f"Experiment seed: {experiment_seed}")
     
-    # Load data
+    # Load data (without normalization first, to avoid test data leakage)
     if verbose:
         print("\nLoading data...")
     z_full, coords, metadata = load_kaust_csv_single(
         config.get('data_file', 'data/2b/2b_7.csv'),
-        normalize=config.get('normalize_target', False)
+        normalize=False  # Don't normalize yet - we'll normalize based on observed data only
     )
     if verbose:
         print(f"Full data shape: {z_full.shape}, Coords: {coords.shape}")
@@ -2241,6 +2241,29 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     # Test set: all non-observed data
     test_mask = ~obs_mask
     print(f"Test: {test_mask.sum()} samples (all unobserved data)")
+    
+    # Normalize based on observed data only (train + valid), then apply to all data
+    # This prevents test data statistics from leaking into normalization
+    if config.get('normalize_target', False):
+        if verbose:
+            print("\nNormalizing data based on observed (train+valid) data only...")
+        # Compute normalization stats from observed data only
+        observed_mask = train_mask | valid_mask
+        z_observed = z_full[observed_mask]
+        z_mean = z_observed.mean()
+        z_std = z_observed.std() + 1e-8  # Add small epsilon to avoid division by zero
+        
+        # Apply normalization to all data (including test)
+        z_full = (z_full - z_mean) / z_std
+        metadata['z_mean'] = z_mean
+        metadata['z_std'] = z_std
+        if verbose:
+            print(f"[INFO] Normalized z (based on observed data): mean={z_mean:.4f}, std={z_std:.4f}")
+            print(f"  Observed data range: [{z_observed.min():.4f}, {z_observed.max():.4f}]")
+            print(f"  Normalized observed range: [{z_full[observed_mask].min():.4f}, {z_full[observed_mask].max():.4f}]")
+    else:
+        metadata['z_mean'] = 0.0
+        metadata['z_std'] = 1.0
     
     # Create datasets
     print("\nCreating datasets...")
