@@ -175,6 +175,82 @@ def load_kaust_csv(
     return z_train, z_test, coords, site_to_idx, metadata
 
 
+def load_test_ground_truth_from_full(
+    full_csv_path: str,
+    site_to_idx: dict,
+    T_te_start: int,
+    T_te: int,
+) -> np.ndarray:
+    """
+    Load test-period z values from the full CSV (e.g. 2b_8.csv) so we can
+    evaluate on the provider's test set. Uses site_to_idx from load_kaust_csv
+    so site order matches.
+
+    Args:
+        full_csv_path: path to full CSV (x, y, t, z) with all time steps
+        site_to_idx: (x, y) -> index from load_kaust_csv
+        T_te_start: first test time step (1-based, e.g. 91)
+        T_te: number of test time steps
+
+    Returns:
+        z_test_gt: (T_te, S) float32 array
+    """
+    df = pd.read_csv(full_csv_path)
+    S = len(site_to_idx)
+    z_test_gt = np.full((T_te, S), np.nan, dtype=np.float32)
+    for _, row in df.iterrows():
+        t_val = int(row['t'])
+        if t_val < T_te_start or t_val > T_te_start + T_te - 1:
+            continue
+        t_idx = t_val - T_te_start  # 0-based
+        key = (float(row['x']), float(row['y']))
+        if key not in site_to_idx:
+            continue
+        site_idx = site_to_idx[key]
+        z_test_gt[t_idx, site_idx] = row['z']
+    return z_test_gt
+
+
+def load_kaust_csv_with_test_gt(
+    train_path: str,
+    test_path: str,
+    full_csv_path: str,
+    normalize: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """
+    Load provider train/test split and fill test z from full CSV for evaluation.
+
+    Returns:
+        z_full: (T_tr + T_te, S) - train then test time steps
+        coords: (S, 2)
+        metadata: includes z_mean, z_std (from train only), T_tr, T_te, T_te_start
+    """
+    z_train, z_test_empty, coords, site_to_idx, meta = load_kaust_csv(
+        train_path, test_path, normalize=False
+    )
+    T_tr = meta['T_tr']
+    T_te = meta['T_te']
+    T_te_start = meta['T_te_start']
+
+    z_test_gt = load_test_ground_truth_from_full(
+        full_csv_path, site_to_idx, T_te_start, T_te
+    )
+    z_full = np.concatenate([z_train, z_test_gt], axis=0).astype(np.float32)
+
+    if normalize:
+        z_train_valid = z_train[~np.isnan(z_train)]
+        z_mean = float(z_train_valid.mean())
+        z_std = float(z_train_valid.std() + 1e-8)
+        z_full = (z_full - z_mean) / z_std
+        meta['z_mean'] = z_mean
+        meta['z_std'] = z_std
+    else:
+        meta['z_mean'] = 0.0
+        meta['z_std'] = 1.0
+
+    return z_full, coords, meta
+
+
 def sample_observed_sites(
     coords: np.ndarray,
     obs_fraction: float,

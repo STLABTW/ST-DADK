@@ -550,13 +550,14 @@ class TemporalBasisEmbedding(nn.Module):
     """
     Temporal basis using Gaussian RBF with multi-resolution centers
     Centers: regular grid with n_centers list (e.g., [10, 15, 45]) in [0,1]
-    Bandwidth: 2.5 × grid spacing for each resolution
+    Bandwidth: temporal_bandwidth_factor × grid spacing for each resolution (default 2.5)
     Basis function: exp(-0.5 * (t - center)^2 / bandwidth^2)
     """
     
-    def __init__(self, n_centers: list = [10, 15, 45]):
+    def __init__(self, n_centers: list = [10, 15, 45], temporal_bandwidth_factor: float = 2.5):
         super().__init__()
         self.n_centers = n_centers
+        self.temporal_bandwidth_factor = temporal_bandwidth_factor
         
         # Initialize centers and bandwidths for each resolution
         centers_list = []
@@ -567,12 +568,12 @@ class TemporalBasisEmbedding(nn.Module):
             centers = torch.linspace(0.0, 1.0, n)
             centers_list.append(centers)
             
-            # Bandwidth = 2.5 × grid spacing
+            # Bandwidth = factor × grid spacing
             if n > 1:
                 grid_spacing = 1.0 / (n - 1)
             else:
                 grid_spacing = 1.0
-            bandwidth = 2.5 * grid_spacing
+            bandwidth = temporal_bandwidth_factor * grid_spacing
             bandwidths_list.append(torch.full((n,), bandwidth))
         
         # Concatenate all centers and bandwidths
@@ -621,7 +622,8 @@ class STInterpMLP(nn.Module):
                  damping_threshold: float = 0.3,
                  damping_strength: float = 1.0,
                  output_dim: int = 1,  # For multi-quantile: output_dim = number of quantiles
-                 use_delta_reparameterization: bool = False):  # Enable δ reparameterization for multi-quantile
+                 use_delta_reparameterization: bool = False,  # Enable δ reparameterization for multi-quantile
+                 temporal_bandwidth_factor: float = 2.5):  # Temporal RBF bandwidth = factor × grid spacing
         super().__init__()
         
         self.p = p
@@ -645,7 +647,8 @@ class STInterpMLP(nn.Module):
         
         # Temporal basis embedding
         self.temporal_basis = TemporalBasisEmbedding(
-            n_centers=k_temporal_centers
+            n_centers=k_temporal_centers,
+            temporal_bandwidth_factor=temporal_bandwidth_factor
         )
         self.k_spatial = self.spatial_basis.k
         self.k_temporal = self.temporal_basis.k_time
@@ -915,5 +918,6 @@ def create_model(config: dict, train_coords: np.ndarray = None) -> STInterpMLP:
         damping_threshold=config.get('damping_threshold', 0.3),
         damping_strength=config.get('damping_strength', 1.0),
         output_dim=output_dim,
-        use_delta_reparameterization=config.get('use_delta_reparameterization', False)
+        use_delta_reparameterization=config.get('use_delta_reparameterization', False),
+        temporal_bandwidth_factor=config.get('temporal_bandwidth_factor', 2.5)
     )

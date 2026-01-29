@@ -30,7 +30,7 @@ from scipy.interpolate import griddata
 sys.path.append(str(Path(__file__).parent.parent))
 
 from stnf.models.st_interp import STInterpMLP, create_model
-from stnf.dataio.kaust_loader import load_kaust_csv_single
+from stnf.dataio.kaust_loader import load_kaust_csv_single, load_kaust_csv_with_test_gt
 from stnf.utils import set_seed, compute_metrics, ModelEMA
 
 
@@ -85,38 +85,37 @@ def non_crossing_penalty(y_pred_multi_q: torch.Tensor, reduction: str = "mean", 
     raise ValueError(f"Unsupported reduction='{reduction}'; use 'mean' or 'sum'.")
 
 
-def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
+def compute_p_nc_delta_penalty(delta_params: list, use_positive_penalty: bool = False) -> torch.Tensor:
     """
     Compute P_nc(δ) penalty on δ parameters as defined in Section 3.2 (Equation 3.10).
     
-    For each quantile k = 2, ..., Q:
-        J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
+    Original formula (use_positive_penalty=False):
+        For each quantile k = 2, ..., Q:
+            J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
+        Then: P_nc(δ) = Σ_{k=2}^Q J(δ_k)
     
-    Then:
-        P_nc(δ) = Σ_{k=2}^Q J(δ_k)
+    NOTE: Original formula always gives J(δ_k) ≤ 0, which when added to loss as
+    loss + λ * P_nc(δ) makes loss more negative (encourages more negative J).
+    This may cause optimization issues.
     
-    This enforces feasibility condition on δ parameters to ensure non-crossing quantiles.
+    Corrected formula (use_positive_penalty=True):
+        For each quantile k = 2, ..., Q:
+            J(δ_k) = max(0, Σ_{j=1}^d max(0, -δ_k,j) - δ_k,0)
+        Then: P_nc(δ) = Σ_{k=2}^Q J(δ_k)
     
-    NOTE: Mathematical property: J(δ_k) ≤ 0 always (since max(δ_k,0, Σ) ≥ δ_k,0).
-    When added to loss as: loss + λ * P_nc(δ), this encourages more negative J(δ_k),
-    which promotes feasibility. However, there is a theoretical risk that δ_k,0 could
-    be pushed toward -infinity if not constrained by other terms in the loss.
-    In practice, the quantile loss term and bounded h(s,t) (if using sigmoid) should
-    prevent this. See Section 3.2 and [17] for details.
-    
-    TODO: Verify sign convention with original paper [17] (Moon et al., 2021).
-    Current implementation matches Equation 3.10 exactly, but the negative sign
-    behavior (rewarding more negative J(δ_k)) may need empirical validation or
-    adjustment (e.g., using -P_nc(δ) or max(0, -P_nc(δ)) instead).
+    This penalizes violations (positive values) rather than rewarding feasibility
+    (negative values), which is more standard for penalty terms.
     
     Args:
         delta_params: List of δ_k Parameter tensors, each of shape (d+1,) where:
             - δ_k[0] is the intercept δ_k,0
             - δ_k[1:] are feature coefficients δ_k,1, ..., δ_k,d
             - d is the last hidden layer dimension
+        use_positive_penalty: If True, use corrected positive penalty formula.
+                              If False, use original formula (for backward compatibility).
     
     Returns:
-        Scalar penalty tensor P_nc(δ) (typically ≤ 0)
+        Scalar penalty tensor P_nc(δ)
     """
     if delta_params is None or len(delta_params) < 2:
         # Need at least 2 quantiles for non-crossing penalty
@@ -141,9 +140,14 @@ def compute_p_nc_delta_penalty(delta_params: list) -> torch.Tensor:
         negative_features = torch.clamp(-delta_k_features, min=0.0)  # max(0, -δ_k,j)
         sum_negative = negative_features.sum()  # Σ_{j=1}^d max(0, -δ_k,j)
         
-        # J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
-        max_term = torch.max(delta_k_0, sum_negative)
-        J_delta_k = delta_k_0 - max_term
+        if use_positive_penalty:
+            # Corrected formula: penalize violations (positive penalty)
+            # J(δ_k) = max(0, Σ_{j=1}^d max(0, -δ_k,j) - δ_k,0)
+            J_delta_k = torch.clamp(sum_negative - delta_k_0, min=0.0)
+        else:
+            # Original formula: J(δ_k) = δ_k,0 - max(δ_k,0, Σ_{j=1}^d max(0, -δ_k,j))
+            max_term = torch.max(delta_k_0, sum_negative)
+            J_delta_k = delta_k_0 - max_term
         
         penalty = penalty + J_delta_k
     
@@ -248,6 +252,40 @@ def compute_crps_multi_quantile(preds, y_true, quantile_levels, weights=None):
     return compute_crps(predictions_dict, y_true, weights=weights)
 
 
+def compute_coverage(preds, y_true, quantile_levels, alpha=0.1):
+    """
+    Empirical coverage of a prediction interval formed by the quantile_levels
+    *closest* to alpha/2 and 1 - alpha/2 (not necessarily exact 0.05/0.95).
+
+    E.g. alpha=0.1: uses the predicted quantiles nearest to 0.05 and 0.95.
+    If quantile_levels = [0.1, 0.5, 0.9], the interval is [q_0.1, q_0.9] (80% nominal),
+    not 90%. For a true 90% PI, use quantile_levels that include 0.05 and 0.95
+    (e.g. [0.05, 0.25, 0.5, 0.75, 0.95]).
+
+    Args:
+        preds: (N, Q) quantile predictions
+        y_true: (N,) or (N, 1) true values
+        quantile_levels: list of quantile levels (e.g. [0.05, 0.25, 0.5, 0.75, 0.95])
+        alpha: nominal miscoverage (0.1 -> interval targets 90% nominal)
+
+    Returns:
+        coverage: fraction of y_true inside the interval; well-calibrated ~ (1 - alpha)
+        when quantile_levels include alpha/2 and 1 - alpha/2.
+    """
+    if y_true.ndim > 1:
+        y_true = y_true.flatten()
+    q_lo = alpha / 2
+    q_hi = 1.0 - alpha / 2
+    # Find indices of quantile_levels closest to q_lo, q_hi
+    quantile_levels = np.asarray(quantile_levels)
+    idx_lo = np.argmin(np.abs(quantile_levels - q_lo))
+    idx_hi = np.argmin(np.abs(quantile_levels - q_hi))
+    low = preds[:, idx_lo]
+    high = preds[:, idx_hi]
+    inside = (y_true >= low) & (y_true <= high)
+    return float(np.mean(inside))
+
+
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
     """
     Create spatial observation probability function
@@ -264,14 +302,14 @@ def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
         return None
     
     elif pattern == 'corner':
-        # Heavy-tailed distribution with sharp peak at (0,0)
-        # p(x,y) ∝ 1 / (1 + intensity * ||[x,y]||²)^2
-        # This is a Cauchy-like distribution with heavier tails than Gaussian
+        # Paper formula: p(s) ∝ (1 + 10||s||)^{-2}
+        # Use distance (not distance squared) and coefficient 10
+        # Note: intensity parameter is ignored for paper formula (always use 10)
         def obs_prob_fn(coord):
             x, y = coord
-            dist_sq = x**2 + y**2
-            # Power law decay: sharper peak, longer tail
-            prob = 1.0 / (1.0 + intensity * dist_sq)**2
+            dist = np.sqrt(x**2 + y**2)  # Use distance, not distance squared
+            # Paper formula: (1 + 10||s||)^{-2} - always use 10, ignore intensity
+            prob = 1.0 / (1.0 + 10.0 * dist)**2
             return prob
         return obs_prob_fn
     
@@ -280,7 +318,7 @@ def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
 
 
 def sample_observations(z_data, coords, obs_method='site-wise', obs_ratio=0.5, 
-                       obs_prob_fn=None, seed=None):
+                       obs_prob_fn=None, seed=None, config=None):
     """
     Sample observations from full data
     
@@ -328,13 +366,25 @@ def sample_observations(z_data, coords, obs_method='site-wise', obs_ratio=0.5,
         return obs_mask, obs_sites
     
     elif obs_method == 'random':
-        # Randomly observe each (time, site) pair
-        # Each site has probability obs_probs[s]
-        obs_probs_expanded = obs_probs[np.newaxis, :].repeat(T, axis=0)
-        obs_mask = np.random.rand(T, S) < obs_probs_expanded
+        # Paper: Each time point samples exactly 10% of sites (fixed per time)
+        # Not Bernoulli sampling (which would have variable counts per time)
+        # Note: obs_ratio is passed as parameter, not from config
+        n_obs_per_time = int(S * obs_ratio)
         
-        # Get list of sites that have at least one observation
-        obs_sites = np.where(obs_mask.any(axis=0))[0]
+        obs_mask = np.zeros((T, S), dtype=bool)
+        obs_sites = set()
+        
+        # Normalize obs_probs to sum to 1 for proper sampling
+        obs_probs_norm = obs_probs / (obs_probs.sum() + 1e-10)
+        
+        for t in range(T):
+            # Sample exactly n_obs_per_time sites at each time point
+            # Use obs_probs as weights (for uniform, all equal; for clustered, weighted by distance)
+            sampled_sites = np.random.choice(S, size=n_obs_per_time, replace=False, p=obs_probs_norm)
+            obs_mask[t, sampled_sites] = True
+            obs_sites.update(sampled_sites)
+        
+        obs_sites = np.array(list(obs_sites))
         
         return obs_mask, obs_sites
     
@@ -533,12 +583,17 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     if warmup_steps > 0:
         print(f"Using warmup: {warmup_epochs} epochs ({warmup_steps} steps)")
     
-    # Initialize EMA
-    # Decay = 1 - 1/(10 * batches_per_epoch)
-    batches_per_epoch = len(train_loader)
-    ema_decay = 1.0 - 1.0 / (10.0 * batches_per_epoch)
-    ema = ModelEMA(model, decay=ema_decay)
-    print(f"EMA initialized: decay={ema_decay:.6f} (batches_per_epoch={batches_per_epoch})")
+    # Initialize EMA (can be disabled via config)
+    use_ema = config.get('use_ema', True)  # Default to True for backward compatibility
+    ema = None
+    if use_ema:
+        # Decay = 1 - 1/(10 * batches_per_epoch)
+        batches_per_epoch = len(train_loader)
+        ema_decay = 1.0 - 1.0 / (10.0 * batches_per_epoch)
+        ema = ModelEMA(model, decay=ema_decay)
+        print(f"EMA initialized: decay={ema_decay:.6f} (batches_per_epoch={batches_per_epoch})")
+    else:
+        print("EMA disabled (use_ema=False)")
     
     # Loss function based on regression type
     regression_type = config.get('regression_type', 'mean')
@@ -647,7 +702,9 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                     if non_crossing_lambda > 0:
                         delta_params = model.get_delta_parameters()
                         if delta_params is not None:
-                            p_nc_delta = compute_p_nc_delta_penalty(delta_params)
+                            # Use positive penalty formula if enabled
+                            use_positive_penalty = config.get('use_positive_p_nc_penalty', False)
+                            p_nc_delta = compute_p_nc_delta_penalty(delta_params, use_positive_penalty=use_positive_penalty)
                             loss = loss + non_crossing_lambda * p_nc_delta
                 else:
                     # Prediction-level penalty (original method)
@@ -708,8 +765,9 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             
             optimizer.step()
             
-            # Update EMA after optimizer step
-            ema.update(model)
+            # Update EMA after optimizer step (if enabled)
+            if ema is not None:
+                ema.update(model)
             
             # Apply warmup by manually adjusting learning rate
             if global_step < warmup_steps:
@@ -734,87 +792,139 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
         
         train_loss /= len(train_loader)
         
-        # Validation with EMA model
+        # Validation with EMA model (if enabled)
+        # Skip validation if validation set is empty (train_ratio=1.0, matches paper)
         model.eval()
-        ema.apply_shadow()  # Use EMA parameters for validation
+        if ema is not None:
+            ema.apply_shadow()  # Use EMA parameters for validation
         
         val_loss = 0.0
         val_preds = []
         val_trues = []
         
+        has_validation = len(val_loader) > 0
+        
         with torch.no_grad():
-            for batch in val_loader:
-                X = batch['X'].to(device)
-                coords = batch['coords'].to(device)
-                t = batch['t'].to(device)
-                y = batch['y'].to(device)
+            if has_validation:
+                for batch in val_loader:
+                    X = batch['X'].to(device)
+                    coords = batch['coords'].to(device)
+                    t = batch['t'].to(device)
+                    y = batch['y'].to(device)
+                    
+                    y_pred = model(X, coords, t)
                 
-                y_pred = model(X, coords, t)
-                
-                # Compute validation loss
-                if regression_type == 'mean':
-                    loss = criterion(y_pred, y)
-                elif regression_type == 'quantile':
-                    loss = quantile_loss(y_pred, y, current_quantile)
-                elif regression_type == 'multi-quantile':
-                    # Use mean quantile loss for validation
-                    losses = []
-                    for q_idx, q_level in enumerate(quantile_levels):
-                        q_pred = y_pred[:, q_idx:q_idx+1]
-                        losses.append(quantile_loss(q_pred, y, q_level))
-                    loss = torch.mean(torch.stack(losses))
+                    # Compute validation loss
+                    if regression_type == 'mean':
+                        loss = criterion(y_pred, y)
+                    elif regression_type == 'quantile':
+                        loss = quantile_loss(y_pred, y, current_quantile)
+                    elif regression_type == 'multi-quantile':
+                        # Use mean quantile loss for validation
+                        losses = []
+                        for q_idx, q_level in enumerate(quantile_levels):
+                            q_pred = y_pred[:, q_idx:q_idx+1]
+                            losses.append(quantile_loss(q_pred, y, q_level))
+                        loss = torch.mean(torch.stack(losses))
 
-                    # Keep validation objective consistent with training objective
-                    # Use same penalty method as training (δ-based or prediction-level)
-                    use_delta_reparam = config.get('use_delta_reparameterization', False)
-                    if use_delta_reparam:
-                        # TODO: Verify sign convention - see compute_p_nc_delta_penalty() docstring.
-                        non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
-                        if non_crossing_lambda > 0:
-                            delta_params = model.get_delta_parameters()
-                            if delta_params is not None:
-                                p_nc_delta = compute_p_nc_delta_penalty(delta_params)
-                                loss = loss + non_crossing_lambda * p_nc_delta
-                    else:
-                        non_crossing_weight = config.get('non_crossing_weight', 0.0)
-                        if non_crossing_weight > 0:
-                            nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
-                            nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
-                            loss = loss + non_crossing_weight * nc_penalty
-                
-                val_loss += loss.item()
-                
-                val_preds.append(y_pred.cpu().numpy())
-                val_trues.append(y.cpu().numpy())
+                        # Keep validation objective consistent with training objective
+                        # Use same penalty method as training (δ-based or prediction-level)
+                        use_delta_reparam = config.get('use_delta_reparameterization', False)
+                        if use_delta_reparam:
+                            # TODO: Verify sign convention - see compute_p_nc_delta_penalty() docstring.
+                            non_crossing_lambda = config.get('non_crossing_lambda', 0.0)
+                            if non_crossing_lambda > 0:
+                                delta_params = model.get_delta_parameters()
+                                if delta_params is not None:
+                                    use_positive_penalty = config.get('use_positive_p_nc_penalty', False)
+                                    p_nc_delta = compute_p_nc_delta_penalty(
+                                        delta_params,
+                                        use_positive_penalty=use_positive_penalty
+                                    )
+                                    loss = loss + non_crossing_lambda * p_nc_delta
+                        else:
+                            non_crossing_weight = config.get('non_crossing_weight', 0.0)
+                            if non_crossing_weight > 0:
+                                nc_power = int(config.get('non_crossing_power', 1))  # 1 or 2
+                                nc_penalty = non_crossing_penalty(y_pred, reduction="mean", power=nc_power)
+                                loss = loss + non_crossing_weight * nc_penalty
+                    
+                    val_loss += loss.item()
+                    
+                    val_preds.append(y_pred.cpu().numpy())
+                    val_trues.append(y.cpu().numpy())
+            else:
+                # No validation set (train_ratio=1.0, matches paper)
+                # Use train loss as proxy for validation
+                val_loss = train_loss
+                val_preds = []
+                val_trues = []
         
-        ema.restore()  # Restore original parameters for training
+        if ema is not None:
+            ema.restore()  # Restore original parameters for training
         
-        val_loss /= len(val_loader)
+        if has_validation:
+            val_loss /= len(val_loader)
+        else:
+            val_loss = train_loss  # Use train loss when no validation set
         
         # Compute RMSE
-        val_preds = np.concatenate(val_preds, axis=0)
-        val_trues = np.concatenate(val_trues, axis=0)
-        
-        # For multi-quantile, use median quantile (typically 0.5) for RMSE
-        if regression_type == 'multi-quantile':
-            # Find median quantile index
-            median_idx = len(quantile_levels) // 2
-            val_preds_for_rmse = val_preds[:, median_idx:median_idx+1]
+        if has_validation and len(val_preds) > 0:
+            val_preds = np.concatenate(val_preds, axis=0)
+            val_trues = np.concatenate(val_trues, axis=0)
+            
+            # For multi-quantile, use median quantile (typically 0.5) for RMSE
+            if regression_type == 'multi-quantile':
+                # Find median quantile index
+                median_idx = len(quantile_levels) // 2
+                val_preds_for_rmse = val_preds[:, median_idx:median_idx+1]
+            else:
+                val_preds_for_rmse = val_preds
+            
+            val_rmse = np.sqrt(np.mean((val_preds_for_rmse - val_trues) ** 2))
         else:
-            val_preds_for_rmse = val_preds
+            # No validation set, use train RMSE as proxy
+            val_rmse = 0.0  # Will be computed from train if needed
         
-        val_rmse = np.sqrt(np.mean((val_preds_for_rmse - val_trues) ** 2))
+        # Compute check_loss for early stopping (if enabled)
+        # This is the metric that CRPS is based on, without penalty
+        use_check_loss_early_stop = config.get('use_check_loss_early_stop', False)
+        if has_validation and len(val_preds) > 0:
+            if use_check_loss_early_stop and regression_type == 'multi-quantile':
+                # Compute mean check loss across all quantiles (same as CRPS computation)
+                check_losses = []
+                for q_idx, q_level in enumerate(quantile_levels):
+                    q_pred = val_preds[:, q_idx:q_idx+1].flatten()
+                    q_true = val_trues.flatten()
+                    check_loss_q = check_loss_numpy(q_pred, q_true, q_level)
+                    check_losses.append(check_loss_q)
+                val_check_loss = np.mean(check_losses)
+            elif use_check_loss_early_stop and regression_type == 'quantile':
+                current_quantile = config.get('current_quantile', 0.5)
+                val_check_loss = check_loss_numpy(val_preds.flatten(), val_trues.flatten(), current_quantile)
+            else:
+                val_check_loss = None
+        else:
+            # No validation set, cannot compute check_loss for early stopping
+            val_check_loss = None
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_rmse'].append(val_rmse)
+        if val_check_loss is not None:
+            if 'val_check_loss' not in history:
+                history['val_check_loss'] = []
+            history['val_check_loss'].append(val_check_loss)
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         history['lr'].append(current_lr)
         
         # Compact output: Epoch | Train Loss | Val Loss | Val RMSE | Status
-        output_str = f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}, RMSE={val_rmse:.6f}"
+        if use_check_loss_early_stop and val_check_loss is not None:
+            output_str = f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}, ValCheck={val_check_loss:.6f}, RMSE={val_rmse:.6f}"
+        else:
+            output_str = f"Epoch {epoch+1}/{epochs}: Train={train_loss:.6f}, Val={val_loss:.6f}, RMSE={val_rmse:.6f}"
         
         # Learning rate scheduling (only after warmup)
         if scheduler is not None and epoch >= warmup_epochs:
@@ -826,17 +936,46 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
             output_str += f", LR={current_lr:.6f}(warmup)"
         
         # Save best model (EMA version)
-        if not np.isnan(val_loss) and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            # Save EMA model as best model
-            ema.apply_shadow()
-            torch.save(model.state_dict(), best_model_path)
-            ema.restore()
-            output_str += " [Best]"
+        # Skip early stopping if no validation set (train_ratio=1.0, matches paper)
+        if not has_validation:
+            # No validation set: save model every epoch (or use final model)
+            # For paper setting, we'll use final model (no early stopping)
+            patience_counter = 0  # Reset counter, no early stopping
+            output_str += " (No validation, using final model)"
+        elif use_check_loss_early_stop and val_check_loss is not None:
+            # Initialize best_val_check_loss if first epoch
+            if epoch == 0:
+                best_val_check_loss = float('inf')
+            # Use check_loss for best model selection
+            if not np.isnan(val_check_loss) and val_check_loss < best_val_check_loss:
+                best_val_check_loss = val_check_loss
+                best_val_loss = val_loss  # Keep track for logging
+                patience_counter = 0
+                # Save model (EMA if enabled, otherwise current)
+                if ema is not None:
+                    ema.apply_shadow()
+                torch.save(model.state_dict(), best_model_path)
+                if ema is not None:
+                    ema.restore()
+                output_str += " [Best]"
+            else:
+                patience_counter += 1
+                output_str += f" ({patience_counter}/{patience})"
         else:
-            patience_counter += 1
-            output_str += f" ({patience_counter}/{patience})"
+            # Original logic: use val_loss
+            if not np.isnan(val_loss) and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save model (EMA if enabled, otherwise current)
+                if ema is not None:
+                    ema.apply_shadow()
+                torch.save(model.state_dict(), best_model_path)
+                if ema is not None:
+                    ema.restore()
+                output_str += " [Best]"
+            else:
+                patience_counter += 1
+                output_str += f" ({patience_counter}/{patience})"
         
         try:
             print(output_str)
@@ -849,7 +988,8 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
                 centers = model.spatial_basis.centers.cpu().numpy().copy()
                 basis_centers_history.append((epoch + 1, centers))
         
-        if patience_counter >= patience:
+        # Skip early stopping if no validation set
+        if has_validation and patience_counter >= patience:
             try:
                 print(f"\nEarly stopping triggered at epoch {epoch+1}")
             except (ValueError, OSError):
@@ -859,11 +999,17 @@ def train_model(model, train_loader, val_loader, config, device, output_dir):
     # Load best model (EMA version) if it exists
     if best_model_path.exists():
         model.load_state_dict(torch.load(best_model_path))
-        print(f"\nTraining Complete! Best Val Loss: {best_val_loss:.6f} (EMA model)")
+        if use_check_loss_early_stop and 'best_val_check_loss' in locals():
+            print(f"\nTraining Complete! Best Val Check Loss: {best_val_check_loss:.6f}, Best Val Loss: {best_val_loss:.6f} (EMA model)")
+        else:
+            print(f"\nTraining Complete! Best Val Loss: {best_val_loss:.6f} (EMA model)")
     else:
-        # If no best model, use final EMA model
-        ema.apply_shadow()
-        print(f"\n[WARNING] No best model saved, using final EMA model")
+        # If no best model, use final model (EMA if enabled)
+        if ema is not None:
+            ema.apply_shadow()
+            print(f"\n[WARNING] No best model saved, using final EMA model")
+        else:
+            print(f"\n[WARNING] No best model saved, using final model")
     
     # Save training history
     import pandas as pd
@@ -892,6 +1038,30 @@ def evaluate_model(model, data_loader, device, config=None):
     all_preds = []
     all_trues = []
     
+    # Handle empty dataset (e.g., when train_ratio=1.0, no validation set)
+    if len(data_loader) == 0 or len(data_loader.dataset) == 0:
+        # Return dummy metrics for empty dataset
+        regression_type = config.get('regression_type', 'mean') if config is not None else 'mean'
+        if regression_type == 'multi-quantile':
+            quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+            n_quantiles = len(quantile_levels)
+            return {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'crps': 0.0,
+                'mean_check_loss': 0.0,
+                'check_loss': 0.0,
+                'coverage_90': 0.0
+            }
+        else:
+            return {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'check_loss': 0.0
+            }
+    
     with torch.no_grad():
         for batch in data_loader:
             X = batch['X'].to(device)
@@ -903,6 +1073,27 @@ def evaluate_model(model, data_loader, device, config=None):
             
             all_preds.append(y_pred.cpu().numpy())
             all_trues.append(y.cpu().numpy())
+    
+    # Handle case where no batches were processed (empty dataset)
+    if len(all_preds) == 0:
+        regression_type = config.get('regression_type', 'mean') if config is not None else 'mean'
+        if regression_type == 'multi-quantile':
+            return {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'crps': 0.0,
+                'mean_check_loss': 0.0,
+                'check_loss': 0.0,
+                'coverage_90': 0.0
+            }
+        else:
+            return {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'check_loss': 0.0
+            }
     
     preds = np.concatenate(all_preds, axis=0)  # (N, 1) or (N, Q)
     trues = np.concatenate(all_trues, axis=0)  # (N, 1)
@@ -957,6 +1148,10 @@ def evaluate_model(model, data_loader, device, config=None):
         
         metrics['mean_check_loss'] = float(np.mean(check_losses))
         metrics['check_loss'] = float(np.mean(check_losses))  # Alias for compatibility
+
+        # Empirical coverage of 90% prediction interval [q_0.05, q_0.95]
+        coverage_90 = compute_coverage(preds, trues, quantile_levels, alpha=0.1)
+        metrics['coverage_90'] = float(coverage_90)
     
     return metrics
 
@@ -2182,85 +2377,174 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         print(f"Experiment seed: {experiment_seed}")
     
     # Load data (without normalization first, to avoid test data leakage)
-    if verbose:
-        print("\nLoading data...")
-    z_full, coords, metadata = load_kaust_csv_single(
-        config.get('data_file', 'data/2b/2b_7.csv'),
-        normalize=False  # Don't normalize yet - we'll normalize based on observed data only
-    )
-    if verbose:
-        print(f"Full data shape: {z_full.shape}, Coords: {coords.shape}")
-    
-    # Sample observations (train + valid)
-    if verbose:
-        print("\nSampling observations...")
-    obs_method = config.get('obs_method', 'site-wise')
-    obs_ratio = config.get('obs_ratio', 0.5)
-    
-    # Define observation probability function
-    obs_spatial_pattern = config.get('obs_spatial_pattern', 'uniform')
-    obs_spatial_intensity = config.get('obs_spatial_intensity', 1.0)
-    
-    obs_prob_fn = create_spatial_obs_prob_fn(
-        pattern=obs_spatial_pattern,
-        intensity=obs_spatial_intensity
-    )
-    
-    obs_mask, obs_sites = sample_observations(
-        z_full, coords, 
-        obs_method=obs_method,
-        obs_ratio=obs_ratio,
-        obs_prob_fn=obs_prob_fn,
-        seed=experiment_seed  # Use experiment-specific seed
-    )
-    
-    n_obs_total = obs_mask.sum()
-    print(f"Observation method: {obs_method}")
-    if obs_spatial_pattern != 'uniform':
-        print(f"Spatial pattern: {obs_spatial_pattern} (intensity={obs_spatial_intensity})")
-    print(f"Observed: {n_obs_total} / {z_full.size} ({n_obs_total/z_full.size*100:.1f}%)")
-    print(f"Observed sites: {len(obs_sites)} / {coords.shape[0]}")
-    
-    # Split train and validation (from observed data)
-    print("\nSplitting train/valid...")
-    split_method = config.get('split_method', 'site-wise')
-    train_ratio = config.get('train_ratio', 0.8)
-    
-    train_mask, valid_mask = split_train_valid(
-        obs_mask, obs_sites,
-        split_method=split_method,
-        train_ratio=train_ratio,
-        seed=experiment_seed + 10000  # Different seed for split
-    )
-    
-    print(f"Split method: {split_method}")
-    print(f"Train: {train_mask.sum()} samples")
-    print(f"Valid: {valid_mask.sum()} samples")
-    print(f"Actual train ratio: {train_mask.sum() / (train_mask.sum() + valid_mask.sum()):.3f}")
-    
-    # Test set: all non-observed data
-    test_mask = ~obs_mask
-    print(f"Test: {test_mask.sum()} samples (all unobserved data)")
+    use_provider_split = config.get('use_provider_split', False)
+    data_file = config.get('data_file', 'data/2b/2b_7.csv')
+
+    if use_provider_split:
+        # Use provider's train/test files (e.g. 2b_8_train.csv, 2b_8_test.csv); test z from full CSV
+        if verbose:
+            print("\nLoading data (provider train/test split)...")
+        base = str(Path(data_file).with_suffix(''))
+        if base.endswith('_train'):
+            base = base[:-6]  # strip _train
+        train_path = base + '_train.csv'
+        test_path = base + '_test.csv'
+        full_path = base + '.csv'
+        z_full, coords, metadata = load_kaust_csv_with_test_gt(
+            train_path, test_path, full_path,
+            normalize=False  # we normalize below using train only
+        )
+        T_full, S = z_full.shape
+        T_tr = metadata['T_tr']
+        if verbose:
+            print(f"Full data shape: {z_full.shape} (train t=1..{T_tr}, test t={T_tr+1}..{T_full})")
+        obs_mask = np.zeros((T_full, S), dtype=bool)
+        obs_mask[:T_tr, :] = True
+        train_mask = obs_mask.copy()
+        valid_mask = np.zeros_like(obs_mask, dtype=bool)
+        test_mask = np.zeros_like(obs_mask, dtype=bool)
+        test_mask[T_tr:, :] = True
+        print("Using provider train/test split (no observation sampling)")
+        print(f"Train: {train_mask.sum()} samples (t=1..{T_tr})")
+        print(f"Valid: {valid_mask.sum()} samples")
+        print(f"Test: {test_mask.sum()} samples (t={T_tr+1}..{T_full})")
+    else:
+        if verbose:
+            print("\nLoading data...")
+        z_full, coords, metadata = load_kaust_csv_single(
+            data_file,
+            normalize=False  # Don't normalize yet - we'll normalize based on observed data only
+        )
+        if verbose:
+            print(f"Full data shape: {z_full.shape}, Coords: {coords.shape}")
+
+        # Sample observations (train + valid)
+        if verbose:
+            print("\nSampling observations...")
+        obs_method = config.get('obs_method', 'site-wise')
+        obs_ratio = config.get('obs_ratio', 0.5)
+
+        # Define observation probability function
+        obs_spatial_pattern = config.get('obs_spatial_pattern', 'uniform')
+        obs_spatial_intensity = config.get('obs_spatial_intensity', 1.0)
+
+        obs_prob_fn = create_spatial_obs_prob_fn(
+            pattern=obs_spatial_pattern,
+            intensity=obs_spatial_intensity
+        )
+
+        obs_mask, obs_sites = sample_observations(
+            z_full, coords,
+            obs_method=obs_method,
+            obs_ratio=obs_ratio,
+            obs_prob_fn=obs_prob_fn,
+            seed=experiment_seed  # Use experiment-specific seed
+        )
+
+        n_obs_total = obs_mask.sum()
+        print(f"Observation method: {obs_method}")
+        if obs_spatial_pattern != 'uniform':
+            print(f"Spatial pattern: {obs_spatial_pattern} (intensity={obs_spatial_intensity})")
+        print(f"Observed: {n_obs_total} / {z_full.size} ({n_obs_total/z_full.size*100:.1f}%)")
+        print(f"Observed sites: {len(obs_sites)} / {coords.shape[0]}")
+
+        # Split train and validation (from observed data)
+        # Paper: Use all 10% observations for training, no validation split
+        # Default to train_ratio=1.0 to match paper (all obs for training)
+        print("\nSplitting train/valid...")
+        split_method = config.get('split_method', 'site-wise')
+        train_ratio = config.get('train_ratio', 1.0)  # Changed default to 1.0 to match paper
+
+        if train_ratio >= 1.0:
+            # Use all observations for training, no validation set (matches paper)
+            train_mask = obs_mask.copy()
+            valid_mask = np.zeros_like(obs_mask, dtype=bool)
+            print("Using all observations for training (train_ratio=1.0, matches paper)")
+        else:
+            train_mask, valid_mask = split_train_valid(
+                obs_mask, obs_sites,
+                split_method=split_method,
+                train_ratio=train_ratio,
+                seed=experiment_seed + 10000  # Different seed for split
+            )
+
+        print(f"Split method: {split_method}")
+        print(f"Train: {train_mask.sum()} samples")
+        print(f"Valid: {valid_mask.sum()} samples")
+        if train_mask.sum() + valid_mask.sum() > 0:
+            print(f"Actual train ratio: {train_mask.sum() / (train_mask.sum() + valid_mask.sum()):.3f}")
+
+        # Test set: all non-observed data
+        test_mask = ~obs_mask
+        print(f"Test: {test_mask.sum()} samples (all unobserved data)")
     
     # Normalize based on observed data only (train + valid), then apply to all data
     # This prevents test data statistics from leaking into normalization
-    if config.get('normalize_target', False):
-        if verbose:
-            print("\nNormalizing data based on observed (train+valid) data only...")
-        # Compute normalization stats from observed data only
-        observed_mask = train_mask | valid_mask
-        z_observed = z_full[observed_mask]
-        z_mean = z_observed.mean()
-        z_std = z_observed.std() + 1e-8  # Add small epsilon to avoid division by zero
+    # Strategy C1: Option to normalize on all data (including test) if normalize_on_all_data=True
+    # Strategy C4: Option to center-only (subtract mean, don't divide by std) for zero-mean GP
+    center_only = config.get('center_only', False)
+    if config.get('normalize_target', False) or center_only:
+        normalize_on_all_data = config.get('normalize_on_all_data', False)
         
-        # Apply normalization to all data (including test)
-        z_full = (z_full - z_mean) / z_std
-        metadata['z_mean'] = z_mean
-        metadata['z_std'] = z_std
-        if verbose:
-            print(f"[INFO] Normalized z (based on observed data): mean={z_mean:.4f}, std={z_std:.4f}")
-            print(f"  Observed data range: [{z_observed.min():.4f}, {z_observed.max():.4f}]")
-            print(f"  Normalized observed range: [{z_full[observed_mask].min():.4f}, {z_full[observed_mask].max():.4f}]")
+        if normalize_on_all_data:
+            if verbose:
+                print("\nNormalizing data based on ALL data (including test)...")
+            # Compute normalization stats from all data (including test)
+            z_all = z_full[~np.isnan(z_full)]
+            z_mean = z_all.mean()
+            z_std = z_all.std() + 1e-8  # Add small epsilon to avoid division by zero
+            
+            # Apply normalization to all data
+            if center_only:
+                # Center-only: subtract mean, don't divide by std (for zero-mean GP)
+                z_full = z_full - z_mean
+                metadata['z_mean'] = z_mean
+                metadata['z_std'] = 1.0  # No scaling
+                if verbose:
+                    print(f"[INFO] Center-only normalization (based on ALL data): mean={z_mean:.4f}, std=1.0 (no scaling)")
+                    print(f"  All data range: [{z_all.min():.4f}, {z_all.max():.4f}]")
+                    print(f"  Centered all data range: [{z_full[~np.isnan(z_full)].min():.4f}, {z_full[~np.isnan(z_full)].max():.4f}]")
+            else:
+                # Full normalization: subtract mean and divide by std
+                z_full = (z_full - z_mean) / z_std
+                metadata['z_mean'] = z_mean
+                metadata['z_std'] = z_std
+                if verbose:
+                    print(f"[INFO] Normalized z (based on ALL data): mean={z_mean:.4f}, std={z_std:.4f}")
+                    print(f"  All data range: [{z_all.min():.4f}, {z_all.max():.4f}]")
+                    print(f"  Normalized all data range: [{z_full[~np.isnan(z_full)].min():.4f}, {z_full[~np.isnan(z_full)].max():.4f}]")
+        else:
+            if verbose:
+                print("\nNormalizing data based on observed (train+valid) data only...")
+            # Compute normalization stats from observed data only
+            # When train_ratio=1.0, valid_mask is empty, so use train_mask only
+            if train_mask.sum() > 0:
+                observed_mask = train_mask | valid_mask
+            else:
+                observed_mask = valid_mask  # Fallback if train_mask is also empty
+            z_observed = z_full[observed_mask]
+            z_mean = z_observed.mean()
+            z_std = z_observed.std() + 1e-8  # Add small epsilon to avoid division by zero
+            
+            # Apply normalization to all data (including test)
+            if center_only:
+                # Center-only: subtract mean, don't divide by std (for zero-mean GP)
+                z_full = z_full - z_mean
+                metadata['z_mean'] = z_mean
+                metadata['z_std'] = 1.0  # No scaling
+                if verbose:
+                    print(f"[INFO] Center-only normalization (based on observed data): mean={z_mean:.4f}, std=1.0 (no scaling)")
+                    print(f"  Observed data range: [{z_observed.min():.4f}, {z_observed.max():.4f}]")
+                    print(f"  Centered observed range: [{z_full[observed_mask].min():.4f}, {z_full[observed_mask].max():.4f}]")
+            else:
+                # Full normalization: subtract mean and divide by std
+                z_full = (z_full - z_mean) / z_std
+                metadata['z_mean'] = z_mean
+                metadata['z_std'] = z_std
+                if verbose:
+                    print(f"[INFO] Normalized z (based on observed data): mean={z_mean:.4f}, std={z_std:.4f}")
+                    print(f"  Observed data range: [{z_observed.min():.4f}, {z_observed.max():.4f}]")
+                    print(f"  Normalized observed range: [{z_full[observed_mask].min():.4f}, {z_full[observed_mask].max():.4f}]")
     else:
         metadata['z_mean'] = 0.0
         metadata['z_std'] = 1.0
@@ -2312,7 +2596,12 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     
     # For validation/test, use larger batch size (no gradient computation needed)
     # Use 4x train batch size or all data at once, whichever is smaller
-    val_batch_size = min(max(batch_size * 16, 32768), len(val_dataset))
+    # Handle empty validation set (train_ratio=1.0, matches paper)
+    if len(val_dataset) > 0:
+        val_batch_size = min(max(batch_size * 16, 32768), len(val_dataset))
+    else:
+        val_batch_size = 1  # Dummy batch size for empty dataset
+    
     test_batch_size = min(max(batch_size * 16, 32768), len(test_dataset))
     
     train_loader = DataLoader(
@@ -2323,13 +2612,26 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         collate_fn=collate_fn
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
+    # Only create val_loader if validation set is not empty
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
+    else:
+        # Create empty DataLoader for compatibility (won't be used)
+        from torch.utils.data import TensorDataset
+        dummy_dataset = TensorDataset(torch.empty(0, 1))
+        val_loader = DataLoader(
+            dummy_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn
+        )
     
     test_loader = DataLoader(
         test_dataset,
@@ -2403,14 +2705,37 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     else:
         print(f"Train - MSE: {train_metrics['mse']:.6f}, MAE: {train_metrics['mae']:.6f}, RMSE: {train_metrics['rmse']:.6f}")
     
-    print("\nEvaluating on Valid set...")
-    val_metrics = evaluate_model(model, val_loader, device, config)
-    if config.get('regression_type') == 'quantile':
-        print(f"Valid - Check Loss: {val_metrics.get('check_loss', val_metrics['mse']):.6f}, MAE: {val_metrics['mae']:.6f}")
-    elif config.get('regression_type') == 'multi-quantile':
-        print(f"Valid - CRPS: {val_metrics['crps']:.6f}, Mean Check Loss: {val_metrics['mean_check_loss']:.6f}, MAE: {val_metrics['mae']:.6f}")
+    # Evaluate on validation set (if exists)
+    if len(val_dataset) > 0:
+        print("\nEvaluating on Valid set...")
+        val_metrics = evaluate_model(model, val_loader, device, config)
+        if config.get('regression_type') == 'quantile':
+            print(f"Valid - Check Loss: {val_metrics.get('check_loss', val_metrics['mse']):.6f}, MAE: {val_metrics['mae']:.6f}")
+        elif config.get('regression_type') == 'multi-quantile':
+            print(f"Valid - CRPS: {val_metrics['crps']:.6f}, Mean Check Loss: {val_metrics['mean_check_loss']:.6f}, MAE: {val_metrics['mae']:.6f}")
+        else:
+            print(f"Valid - MSE: {val_metrics['mse']:.6f}, MAE: {val_metrics['mae']:.6f}, RMSE: {val_metrics['rmse']:.6f}")
     else:
-        print(f"Valid - MSE: {val_metrics['mse']:.6f}, MAE: {val_metrics['mae']:.6f}, RMSE: {val_metrics['rmse']:.6f}")
+        print("\nNo validation set (train_ratio=1.0, matches paper)")
+        # Create dummy val_metrics for compatibility
+        regression_type = config.get('regression_type', 'mean')
+        if regression_type == 'multi-quantile':
+            val_metrics = {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'crps': 0.0,
+                'mean_check_loss': 0.0,
+                'check_loss': 0.0,
+                'coverage_90': 0.0
+            }
+        else:
+            val_metrics = {
+                'mse': 0.0,
+                'mae': 0.0,
+                'rmse': 0.0,
+                'check_loss': 0.0
+            }
     
     print("\nEvaluating on Test set...")
     test_metrics = evaluate_model(model, test_loader, device, config)
@@ -2418,6 +2743,8 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         print(f"Test  - Check Loss: {test_metrics.get('check_loss', test_metrics['mse']):.6f}, MAE: {test_metrics['mae']:.6f}")
     elif config.get('regression_type') == 'multi-quantile':
         print(f"Test  - CRPS: {test_metrics['crps']:.6f}, Mean Check Loss: {test_metrics['mean_check_loss']:.6f}, MAE: {test_metrics['mae']:.6f}")
+        if 'coverage_90' in test_metrics:
+            print(f"Test  - Coverage (90% PI): {test_metrics['coverage_90']:.4f} (target 0.90)")
     else:
         print(f"Test  - MSE: {test_metrics['mse']:.6f}, MAE: {test_metrics['mae']:.6f}, RMSE: {test_metrics['rmse']:.6f}")
     
@@ -2480,6 +2807,10 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
             'train_check_loss': train_metrics['mean_check_loss'],
             'valid_check_loss': val_metrics['mean_check_loss'],
             'test_check_loss': test_metrics['mean_check_loss'],
+            # Empirical coverage of 90% prediction interval (for conformal / calibration)
+            'train_coverage_90': train_metrics.get('coverage_90', 0.0),
+            'valid_coverage_90': val_metrics.get('coverage_90', 0.0),
+            'test_coverage_90': test_metrics.get('coverage_90', 0.0),
             # Keep compatibility with old format (using median quantile)
             'train_mse': train_metrics['mse'],
             'valid_mse': val_metrics['mse'],

@@ -45,6 +45,7 @@ layernorm: true                       # Use LayerNorm
 p_covariates: 0                       # Number of covariates
 
 # Data settings
+use_provider_split: false        # If true: load data_file_train / data_file_test (e.g. 2b_8_train.csv, 2b_8_test.csv); train = t=1..T_tr, test = t=T_tr+1..T
 obs_method: site-wise             # Observation method: 'site-wise' or 'random'
 obs_ratio: 0.1                    # Observation ratio
 obs_spatial_pattern: corner       # Spatial observation pattern: 'uniform' or 'corner'
