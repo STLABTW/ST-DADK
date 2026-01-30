@@ -3571,6 +3571,7 @@ def main():
     parser.add_argument('--start_exp_id', type=int, default=None, help='Starting experiment ID (1-based)')
     parser.add_argument('--end_exp_id', type=int, default=None, help='Ending experiment ID (inclusive)')
     parser.add_argument('--skip-existing', action='store_true', help='Skip experiments that already have results.json')
+    parser.add_argument('--output_dir', type=str, default=None, help='Override base output directory (e.g. results/table_4_4_<ts>/Fixed_Uniform_STDK)')
     args = parser.parse_args()
     
     # Load config
@@ -3593,13 +3594,14 @@ def main():
     # Get experiment tag
     tag = config.get('tag', 'default')
     
-    # Create base output directory with date/time/tag
-    now = datetime.now()
-    date_str = now.strftime('%Y%m%d')
-    time_str = now.strftime('%H%M%S')
-    
-    # Path: results/<date>/<time>_<tag>/
-    base_output_dir = Path('results') / date_str / f"{time_str}_{tag}"
+    # Base output directory: override with --output_dir or use results/<date>/<time>_<tag>/
+    if args.output_dir is not None:
+        base_output_dir = Path(args.output_dir)
+    else:
+        now = datetime.now()
+        date_str = now.strftime('%Y%m%d')
+        time_str = now.strftime('%H%M%S')
+        base_output_dir = Path('results') / date_str / f"{time_str}_{tag}"
     experiments_dir = base_output_dir / 'experiments'
     experiments_dir.mkdir(parents=True, exist_ok=True)
     
