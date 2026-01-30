@@ -51,7 +51,9 @@ obs_ratio: 0.1                    # Observation ratio
 obs_spatial_pattern: corner       # Spatial observation pattern: 'uniform' or 'corner'
 obs_spatial_intensity: 10.0        # Intensity of spatial pattern (for 'corner': higher = stronger near (0,0))
 split_method: random              # Train/valid split method: 'site-wise' or 'random'
-train_ratio: 0.8                  # Train/valid split ratio
+train_ratio: 0.8                  # Train/valid split ratio (1.0 = all obs for training, no valid)
+calibration_ratio_from_train: 0.3 # When train_ratio=1.0 and multi-quantile: fraction of train for conformal cal (0.1–0.3); 0 = off
+calibration_split_method: random  # How to split cal from train: 'random' (random (t,s)) or 'site-wise' (subset of sites → cal, more like test)
 normalize_target: false           # Normalize target values
 
 # Training settings

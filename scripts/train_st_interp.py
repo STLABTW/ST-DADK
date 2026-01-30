@@ -32,6 +32,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from stnf.models.st_interp import STInterpMLP, create_model
 from stnf.dataio.kaust_loader import load_kaust_csv_single, load_kaust_csv_with_test_gt
 from stnf.utils import set_seed, compute_metrics, ModelEMA
+from stnf.utils.conformal import compute_cqr_qhat, compute_conformal_coverage
 
 
 def quantile_loss(y_pred, y_true, quantile):
@@ -284,6 +285,32 @@ def compute_coverage(preds, y_true, quantile_levels, alpha=0.1):
     high = preds[:, idx_hi]
     inside = (y_true >= low) & (y_true <= high)
     return float(np.mean(inside))
+
+
+def _get_quantile_predictions(model, data_loader, device):
+    """
+    Run model on data_loader and return (preds, trues) for multi-quantile.
+    preds: (N, Q), trues: (N,). Returns ([], []) if loader is empty.
+    """
+    model.eval()
+    all_preds = []
+    all_trues = []
+    with torch.no_grad():
+        for batch in data_loader:
+            X = batch['X'].to(device)
+            coords = batch['coords'].to(device)
+            t = batch['t'].to(device)
+            y = batch['y'].to(device)
+            y_pred = model(X, coords, t)
+            all_preds.append(y_pred.cpu().numpy())
+            all_trues.append(y.cpu().numpy())
+    if len(all_preds) == 0:
+        return np.empty((0, 0)), np.empty(0)
+    preds = np.concatenate(all_preds, axis=0)
+    trues = np.concatenate(all_trues, axis=0)
+    if trues.ndim > 1:
+        trues = trues.flatten()
+    return preds, trues
 
 
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
@@ -1496,7 +1523,8 @@ def plot_spatial_mse(model, z_full, coords, train_mask, device, output_dir,
 
 
 def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir, 
-                         valid_mask=None, test_mask=None, n_sites=4, quantile_models=None, quantile_levels=None):
+                         valid_mask=None, test_mask=None, n_sites=4, quantile_models=None, quantile_levels=None,
+                         conformal_qhat=None, conformal_alpha=0.1):
     """
     Plot temporal series for selected spatial locations
     
@@ -1512,6 +1540,8 @@ def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
         n_sites: number of sites to plot
         quantile_models: dict of {quantile_level: model} for quantile regression (optional)
         quantile_levels: list of quantile levels (optional)
+        conformal_qhat: CQR expansion (optional); if set, plot conformal 90% PI band [q_lo-qhat, q_hi+qhat]
+        conformal_alpha: nominal miscoverage for conformal (0.1 -> 90% PI)
     """
     matplotlib.use('Agg')
     
@@ -1718,6 +1748,27 @@ def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                 ax.plot(time_points, pred_values, 
                        color=colors[q_idx], linewidth=2, 
                        label=f'τ={q_level}', alpha=0.8)
+            
+            # Conformal 90% PI: draw only the *expansion margin* (qhat) so it's clearly distinct from quantile band
+            if conformal_qhat is not None and conformal_qhat > 0:
+                q_lo = conformal_alpha / 2
+                q_hi = 1.0 - conformal_alpha / 2
+                q_levels_arr = np.asarray(quantile_levels)
+                idx_lo = np.argmin(np.abs(q_levels_arr - q_lo))
+                idx_hi = np.argmin(np.abs(q_levels_arr - q_hi))
+                q_lo_level = quantile_levels[idx_lo]
+                q_hi_level = quantile_levels[idx_hi]
+                q_lo_line = quantile_predictions[q_lo_level][:, site_idx]
+                q_hi_line = quantile_predictions[q_hi_level][:, site_idx]
+                conf_low = q_lo_line - conformal_qhat
+                conf_high = q_hi_line + conformal_qhat
+                # Fill only the conformal *margin* (below q_lo and above q_hi) so it's obvious conformal = quantile + expansion
+                ax.fill_between(time_points, conf_low, q_lo_line, alpha=0.4, color='purple', 
+                                label='90% PI (conformal margin)' if idx == 0 else None, zorder=1)
+                ax.fill_between(time_points, q_hi_line, conf_high, alpha=0.4, color='purple', zorder=1)
+                ax.plot(time_points, conf_low, '--', color='purple', linewidth=2, alpha=0.9, 
+                        label='conformal bound' if idx == 0 else None, zorder=2)
+                ax.plot(time_points, conf_high, '--', color='purple', linewidth=2, alpha=0.9, zorder=2)
             
             # Plot observed data (all circles) - Test: gray, Train+Valid: black
             if test_obs.sum() > 0:
@@ -2402,6 +2453,7 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         obs_mask[:T_tr, :] = True
         train_mask = obs_mask.copy()
         valid_mask = np.zeros_like(obs_mask, dtype=bool)
+        cal_mask = np.zeros_like(obs_mask, dtype=bool)
         test_mask = np.zeros_like(obs_mask, dtype=bool)
         test_mask[T_tr:, :] = True
         print("Using provider train/test split (no observation sampling)")
@@ -2460,6 +2512,60 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
             train_mask = obs_mask.copy()
             valid_mask = np.zeros_like(obs_mask, dtype=bool)
             print("Using all observations for training (train_ratio=1.0, matches paper)")
+            # Option B: split a calibration set from train for conformal when valid is empty
+            calibration_ratio_from_train = config.get('calibration_ratio_from_train', 0.0)
+            calibration_split_method = config.get('calibration_split_method', 'random')
+            if calibration_ratio_from_train > 0 and config.get('regression_type') == 'multi-quantile':
+                if calibration_split_method == 'site-wise':
+                    # Use a subset of observed *sites* as calibration (cal more like test: different sites).
+                    # calibration_ratio_from_train here = fraction of *sites*, not samples; cal sample count depends on obs per site.
+                    if len(obs_sites) < 2:
+                        cal_mask = np.zeros_like(train_mask, dtype=bool)
+                        print("[WARNING] calibration_split_method=site-wise but only 1 observed site; skipping calibration split.")
+                    else:
+                        n_cal_sites = max(1, min(int(len(obs_sites) * calibration_ratio_from_train), len(obs_sites) - 1))  # keep >= 1 site for train
+                        rng = np.random.default_rng(experiment_seed + 20000)
+                        site_order = np.array(obs_sites, dtype=int)
+                        rng.shuffle(site_order)
+                        cal_sites = set(site_order[:n_cal_sites])
+                        cal_mask = np.zeros_like(train_mask, dtype=bool)
+                        train_mask_new = np.zeros_like(train_mask, dtype=bool)
+                        for s in obs_sites:
+                            if s in cal_sites:
+                                cal_mask[:, s] = train_mask[:, s]
+                            else:
+                                train_mask_new[:, s] = train_mask[:, s]
+                        train_mask = train_mask_new
+                        pct_sites = 100.0 * len(cal_sites) / len(obs_sites) if len(obs_sites) > 0 else 0.0
+                        cal_ratio_samples = cal_mask.sum() / n_obs_total if n_obs_total > 0 else 0.0
+                        print(
+                            "Calibration from train (site-wise): "
+                            f"{cal_mask.sum()} samples ({len(cal_sites)} sites, "
+                            f"{pct_sites:.0f}% of sites, {cal_ratio_samples*100:.1f}% of obs) for conformal"
+                        )
+                else:
+                    # random: random (t,s) from train (default; calibration_ratio_from_train = fraction of *samples*)
+                    flat_idx = np.where(train_mask.ravel())[0]
+                    if len(flat_idx) < 2:
+                        cal_mask = np.zeros_like(train_mask, dtype=bool)
+                        print("[WARNING] calibration_split_method=random but <2 observed samples; skipping calibration split.")
+                    else:
+                        n_cal = max(1, min(int(len(flat_idx) * calibration_ratio_from_train), len(flat_idx) - 1))  # keep >= 1 sample for train
+                        rng = np.random.default_rng(experiment_seed + 20000)
+                        rng.shuffle(flat_idx)
+                        cal_flat = flat_idx[:n_cal]
+                        train_flat = flat_idx[n_cal:]
+                        cal_mask = np.zeros_like(train_mask, dtype=bool)
+                        cal_mask.ravel()[cal_flat] = True
+                        train_mask = np.zeros_like(train_mask, dtype=bool)
+                        train_mask.ravel()[train_flat] = True
+                        cal_ratio_samples = cal_mask.sum() / n_obs_total if n_obs_total > 0 else 0.0
+                        print(
+                            "Calibration from train (random): "
+                            f"{cal_mask.sum()} samples ({cal_ratio_samples*100:.1f}% of obs) for conformal"
+                        )
+            else:
+                cal_mask = np.zeros_like(obs_mask, dtype=bool)
         else:
             train_mask, valid_mask = split_train_valid(
                 obs_mask, obs_sites,
@@ -2467,10 +2573,13 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
                 train_ratio=train_ratio,
                 seed=experiment_seed + 10000  # Different seed for split
             )
+            cal_mask = np.zeros_like(obs_mask, dtype=bool)  # no cal split when we have valid
 
         print(f"Split method: {split_method}")
         print(f"Train: {train_mask.sum()} samples")
         print(f"Valid: {valid_mask.sum()} samples")
+        if cal_mask.sum() > 0:
+            print(f"Calibration (from train): {cal_mask.sum()} samples")
         if train_mask.sum() + valid_mask.sum() > 0:
             print(f"Actual train ratio: {train_mask.sum() / (train_mask.sum() + valid_mask.sum()):.3f}")
 
@@ -2555,10 +2664,13 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     
     train_dataset = create_dataset_from_mask(z_full, coords, train_mask, p_covariates)
     val_dataset = create_dataset_from_mask(z_full, coords, valid_mask, p_covariates)
+    cal_dataset = create_dataset_from_mask(z_full, coords, cal_mask, p_covariates)
     test_dataset = create_dataset_from_mask(z_full, coords, test_mask, p_covariates)
     
     print(f"Train dataset: {len(train_dataset)} samples")
     print(f"Val dataset: {len(val_dataset)} samples")
+    if len(cal_dataset) > 0:
+        print(f"Calibration dataset: {len(cal_dataset)} samples (from train split)")
     print(f"Test dataset: {len(test_dataset)} samples")
     
     # Create dataloaders
@@ -2627,6 +2739,26 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         dummy_dataset = TensorDataset(torch.empty(0, 1))
         val_loader = DataLoader(
             dummy_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn
+        )
+    
+    # Calibration loader (Option B: from-train split when valid is empty)
+    if len(cal_dataset) > 0:
+        cal_batch_size = min(max(batch_size * 16, 32768), len(cal_dataset))
+        cal_loader = DataLoader(
+            cal_dataset,
+            batch_size=cal_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
+    else:
+        from torch.utils.data import TensorDataset
+        cal_loader = DataLoader(
+            TensorDataset(torch.empty(0, 1)),
             batch_size=1,
             shuffle=False,
             num_workers=0,
@@ -2748,6 +2880,44 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     else:
         print(f"Test  - MSE: {test_metrics['mse']:.6f}, MAE: {test_metrics['mae']:.6f}, RMSE: {test_metrics['rmse']:.6f}")
     
+    # Conformal calibration (CQR): multi-quantile + (valid set or calibration-from-train)
+    conformal_alpha = 0.1
+    conformal_qhat = None
+    calibration_n = None
+    calibration_coverage_90 = None  # diagnostic: coverage of conformal interval on cal set (target ~0.90)
+    calibration_loader = val_loader if len(val_dataset) > 0 else (cal_loader if len(cal_dataset) > 0 else None)
+    if (
+        config.get('regression_type') == 'multi-quantile'
+        and calibration_loader is not None
+        and len(calibration_loader.dataset) > 0
+    ):
+        quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        cal_preds, cal_y_true = _get_quantile_predictions(model, calibration_loader, device)
+        if cal_preds.size > 0:
+            conformal_qhat, calibration_n = compute_cqr_qhat(
+                cal_preds, cal_y_true, quantile_levels, alpha=conformal_alpha
+            )
+            print(f"Conformal qhat: {conformal_qhat:.6f} (calibration n={calibration_n})  [small qhat => interval already good or cal/test mismatch]")
+            # Calibration coverage: fraction of cal set inside [q_lo-qhat, q_hi+qhat] (diagnostic: should be ~0.90)
+            calibration_coverage_90 = compute_conformal_coverage(
+                cal_preds, cal_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+            )
+            print(f"Calibration - Coverage (90% PI, conformal): {calibration_coverage_90:.4f} (target 0.90)")
+            test_preds, test_y_true = _get_quantile_predictions(model, test_loader, device)
+            coverage_90_conformal = compute_conformal_coverage(
+                test_preds, test_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+            )
+            test_metrics['coverage_90_conformal'] = coverage_90_conformal
+            print(f"Test  - Coverage (90% PI, conformal): {coverage_90_conformal:.4f} (target 0.90)")
+            # Optional: train/valid conformal coverage for debugging
+            train_preds, train_y_true = _get_quantile_predictions(model, train_loader, device)
+            train_metrics['coverage_90_conformal'] = compute_conformal_coverage(
+                train_preds, train_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+            )
+            val_metrics['coverage_90_conformal'] = compute_conformal_coverage(
+                cal_preds, cal_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+            )
+    
     # Calculate total time
     total_time = time.time() - start_time
     
@@ -2811,6 +2981,14 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
             'train_coverage_90': train_metrics.get('coverage_90', 0.0),
             'valid_coverage_90': val_metrics.get('coverage_90', 0.0),
             'test_coverage_90': test_metrics.get('coverage_90', 0.0),
+            # Conformal (CQR) coverage and params; only when calibration set exists
+            'conformal_qhat': conformal_qhat,
+            'conformal_alpha': conformal_alpha if conformal_qhat is not None else None,
+            'calibration_n': calibration_n,
+            'calibration_coverage_90': calibration_coverage_90,  # diagnostic: conformal coverage on cal set (target ~0.90)
+            'train_coverage_90_conformal': train_metrics.get('coverage_90_conformal'),
+            'valid_coverage_90_conformal': val_metrics.get('coverage_90_conformal'),
+            'test_coverage_90_conformal': test_metrics.get('coverage_90_conformal'),
             # Keep compatibility with old format (using median quantile)
             'train_mse': train_metrics['mse'],
             'valid_mse': val_metrics['mse'],
@@ -2887,7 +3065,8 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
         plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                             valid_mask=valid_mask, test_mask=test_mask, n_sites=4,
-                            quantile_levels=quantile_levels)
+                            quantile_levels=quantile_levels,
+                            conformal_qhat=conformal_qhat, conformal_alpha=conformal_alpha)
     else:
         plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                             valid_mask=valid_mask, test_mask=test_mask, n_sites=4)

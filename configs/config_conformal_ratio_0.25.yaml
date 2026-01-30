@@ -1,0 +1,53 @@
+# Spatio-Temporal Interpolation Model Configuration
+# Conformal ratio sweep: 0.25 (random split, 3 seeds)
+
+tag: cal_ratio_0.25
+data_file: data/2a/2a_8.csv
+k_spatial_centers: [25, 81, 121]
+k_temporal_centers: [10, 15, 45]
+spatial_basis_function: wendland
+spatial_init_method: gmm
+spatial_learnable: true
+gradient_damping: true
+damping_threshold: 0.0
+damping_strength: 5.0
+domain_penalty_weight: 0.01
+movement_penalty_weight: 0.0
+sparsity_penalty_type: sparse_group
+sparsity_lambda_l1: 0.0
+sparsity_lambda_group: 0.0
+sparsity_apply_to_spatial: true
+sparsity_apply_to_temporal: false
+sparsity_threshold_ratio: 0.01
+hidden_dims: [256, 256, 128]
+dropout: 0.1
+layernorm: true
+p_covariates: 0
+use_provider_split: false
+obs_method: site-wise
+obs_ratio: 0.1
+obs_spatial_pattern: corner
+obs_spatial_intensity: 10.0
+split_method: random
+train_ratio: 1.0
+calibration_ratio_from_train: 0.25
+calibration_split_method: random
+normalize_target: false
+epochs: 500
+lr: 2e-2
+basis_lr_ratio: 0.05
+weight_decay: 5e-4
+batch_size: 4096
+patience: 50
+grad_clip: 10.0
+scheduler: cosine
+warmup_epochs: 10
+basis_unfreeze_epoch: 10
+basis_lr_rampup_epochs: 10
+n_experiments: 3
+base_seed: 2025
+num_workers: 0
+regression_type: multi-quantile
+quantile_levels: [0.05, 0.25, 0.5, 0.75, 0.95]
+use_delta_reparameterization: false
+device: cpu
