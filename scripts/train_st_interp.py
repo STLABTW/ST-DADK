@@ -3582,7 +3582,11 @@ def create_averaged_spatial_coverage(all_results, summary_dir, quantile_levels=N
         if coords_ref is None:
             coords_ref = coords
             spatial_centers_ref = spatial_centers
-        if spatial_centers_ref is not None and len(spatial_centers) == len(spatial_centers_ref):
+        if (
+            spatial_centers_ref is not None
+            and len(spatial_centers) == len(spatial_centers_ref)
+            and np.allclose(spatial_centers, spatial_centers_ref, atol=1e-6)
+        ):
             all_qhat_per_center.append(qhat_per_center)
 
     if len(all_cov_nominal) == 0:
