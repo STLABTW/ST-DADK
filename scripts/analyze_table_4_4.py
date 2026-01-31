@@ -57,7 +57,13 @@ def load_table_4_4_results(results_dir: Path):
                     scenario_data = json.load(f)
                     results.extend(scenario_data.get('results', []))
             else:
-                for exp_dir in scenario_dir.iterdir():
+                # train_st_interp layout: experiments/1/, experiments/2/, ...
+                exp_parent = scenario_dir / 'experiments'
+                if exp_parent.exists():
+                    search_dirs = list(exp_parent.iterdir())
+                else:
+                    search_dirs = list(scenario_dir.iterdir())
+                for exp_dir in search_dirs:
                     if not exp_dir.is_dir():
                         continue
                     results_path = exp_dir / 'results.json'
