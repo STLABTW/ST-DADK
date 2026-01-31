@@ -92,8 +92,15 @@ def create_table_4_4(results: list):
                 std_crps = np.std(crps_values)
                 test_cov = subset.get('test_coverage_90')
                 test_cov_conf = subset.get('test_coverage_90_conformal')
+                test_cov_global = subset.get('test_coverage_90_conformal_global')
+                test_cov_cluster = subset.get('test_coverage_90_conformal_cluster')
                 qhat_vals = subset.get('conformal_qhat')
-                cal_cov = subset.get('valid_coverage_90_conformal')
+                mean_qhat_global = subset.get('mean_qhat_global')
+                mean_qhat_cluster = subset.get('mean_qhat_cluster')
+                # Prefer calibration_coverage_90 (works for cal-from-train when train_ratio=1.0); fallback to valid
+                cal_cov = subset.get('calibration_coverage_90')
+                if cal_cov is None:
+                    cal_cov = subset.get('valid_coverage_90_conformal')
 
                 def _mean_std(series):
                     if series is None:
@@ -105,7 +112,11 @@ def create_table_4_4(results: list):
 
                 mean_test_cov, std_test_cov = _mean_std(test_cov)
                 mean_test_cov_conf, std_test_cov_conf = _mean_std(test_cov_conf)
+                mean_test_cov_global, _ = _mean_std(test_cov_global)
+                mean_test_cov_cluster, _ = _mean_std(test_cov_cluster)
                 mean_qhat, std_qhat = _mean_std(qhat_vals)
+                mqg, _ = _mean_std(mean_qhat_global)
+                mqc, _ = _mean_std(mean_qhat_cluster)
                 mean_cal_cov, std_cal_cov = _mean_std(cal_cov)
 
                 summary.append({
@@ -118,8 +129,12 @@ def create_table_4_4(results: list):
                     'Std Test Coverage 90': std_test_cov,
                     'Mean Test Coverage 90 (Conformal)': mean_test_cov_conf,
                     'Std Test Coverage 90 (Conformal)': std_test_cov_conf,
+                    'Mean Test Coverage 90 (Conformal Global)': mean_test_cov_global,
+                    'Mean Test Coverage 90 (Conformal Cluster)': mean_test_cov_cluster,
                     'Mean Conformal Qhat': mean_qhat,
                     'Std Conformal Qhat': std_qhat,
+                    'Mean Qhat Global': mqg,
+                    'Mean Qhat Cluster': mqc,
                     'Mean Calibration Coverage 90': mean_cal_cov,
                     'Std Calibration Coverage 90': std_cal_cov,
                     'N': len(subset)
@@ -190,7 +205,9 @@ def print_table_4_4(pivot_df, pivot_std, summary_df):
             'Observation Scenario', 'Observation Distribution', 'Model', 'N',
             'Mean Test Coverage 90', 'Std Test Coverage 90',
             'Mean Test Coverage 90 (Conformal)', 'Std Test Coverage 90 (Conformal)',
+            'Mean Test Coverage 90 (Conformal Global)', 'Mean Test Coverage 90 (Conformal Cluster)',
             'Mean Conformal Qhat', 'Std Conformal Qhat',
+            'Mean Qhat Global', 'Mean Qhat Cluster',
             'Mean Calibration Coverage 90', 'Std Calibration Coverage 90'
         ]
         available = [c for c in cols if c in summary_df.columns]

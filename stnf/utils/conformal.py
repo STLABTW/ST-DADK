@@ -71,3 +71,101 @@ def compute_conformal_coverage(preds, y_true, quantile_levels, qhat, alpha=0.1):
     high = preds[:, idx_hi] + qhat
     inside = (y_true >= low) & (y_true <= high)
     return float(np.mean(inside))
+
+
+def _assign_nearest_center(coords, centers):
+    """Assign each point to nearest spatial center. Returns cluster_ids (N,)."""
+    coords = np.asarray(coords)
+    if coords.ndim == 1:
+        coords = coords.reshape(-1, 2)
+    centers = np.asarray(centers)
+    # (N, 2) vs (C, 2) -> distances (N, C)
+    d = np.sum((coords[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+    return np.argmin(d, axis=1)
+
+
+def compute_cluster_aware_cqr(
+    cal_preds, cal_y_true, cal_coords, centers,
+    quantile_levels, alpha=0.1, min_n=30, global_qhat_fallback=None
+):
+    """
+    Cluster-aware CQR: compute qhat per cluster, fallback to global for small clusters.
+
+    Args:
+        cal_preds: (N, Q) calibration predictions
+        cal_y_true: (N,) calibration true values
+        cal_coords: (N, 2) spatial coordinates
+        centers: (C, 2) spatial centers (init or grid; avoid trained for no leakage)
+        quantile_levels: list of quantile levels
+        alpha: nominal miscoverage (0.1 -> 90%)
+        min_n: minimum samples per cluster; else use global fallback
+        global_qhat_fallback: if provided, use when cluster too small; else compute from cluster
+
+    Returns:
+        qhat_per_cluster: dict mapping cluster_id -> qhat (or global fallback)
+        global_qhat: global qhat (for fallback and reporting)
+        mean_qhat_cluster: mean of per-cluster qhats (for reporting)
+        num_fallback_clusters: number of clusters that used global fallback (n < min_n)
+    """
+    if cal_y_true.ndim > 1:
+        cal_y_true = cal_y_true.flatten()
+    quantile_levels = np.asarray(quantile_levels)
+    q_lo, q_hi = alpha / 2, 1.0 - alpha / 2
+    idx_lo = np.argmin(np.abs(quantile_levels - q_lo))
+    idx_hi = np.argmin(np.abs(quantile_levels - q_hi))
+    q_lo_pred = cal_preds[:, idx_lo]
+    q_hi_pred = cal_preds[:, idx_hi]
+    scores = np.maximum.reduce([
+        q_lo_pred - cal_y_true, cal_y_true - q_hi_pred, np.zeros_like(cal_y_true)
+    ])
+
+    cluster_ids = _assign_nearest_center(cal_coords, centers)
+    n_global = len(scores)
+    k_global = min(int(np.ceil((n_global + 1) * (1.0 - alpha))), n_global)
+    global_qhat = float(np.partition(scores, k_global - 1)[k_global - 1]) if k_global >= 1 else float(np.max(scores))
+    global_qhat = max(global_qhat, 0.0)
+    fallback_val = global_qhat_fallback if global_qhat_fallback is not None else global_qhat
+
+    qhat_per_cluster = {}
+    num_fallback_clusters = 0
+    for c in range(len(centers)):
+        mask = cluster_ids == c
+        n_c = mask.sum()
+        if n_c < min_n:
+            qhat_per_cluster[c] = fallback_val
+            num_fallback_clusters += 1
+        else:
+            sc = scores[mask]
+            k_c = min(int(np.ceil((n_c + 1) * (1.0 - alpha))), n_c)
+            qhat_c = float(np.partition(sc, k_c - 1)[k_c - 1]) if k_c >= 1 else float(np.max(sc))
+            qhat_per_cluster[c] = max(qhat_c, 0.0)
+
+    used_qhats = [qhat_per_cluster[c] for c in range(len(centers)) if (cluster_ids == c).any()]
+    mean_qhat_cluster = float(np.mean(used_qhats)) if used_qhats else global_qhat
+
+    return qhat_per_cluster, global_qhat, mean_qhat_cluster, num_fallback_clusters
+
+
+def compute_cluster_conformal_coverage(
+    preds, y_true, coords, centers, qhat_per_cluster,
+    quantile_levels, alpha=0.1, global_qhat_fallback=0.0
+):
+    """
+    Coverage of cluster-wise conformal intervals. Each point uses its cluster's qhat.
+    """
+    if y_true.ndim > 1:
+        y_true = y_true.flatten()
+    quantile_levels = np.asarray(quantile_levels)
+    q_lo, q_hi = alpha / 2, 1.0 - alpha / 2
+    idx_lo = np.argmin(np.abs(quantile_levels - q_lo))
+    idx_hi = np.argmin(np.abs(quantile_levels - q_hi))
+
+    cluster_ids = _assign_nearest_center(coords, centers)
+    qhats = np.array([
+        qhat_per_cluster.get(c, global_qhat_fallback)
+        for c in cluster_ids
+    ])
+    low = preds[:, idx_lo] - qhats
+    high = preds[:, idx_hi] + qhats
+    inside = (y_true >= low) & (y_true <= high)
+    return float(np.mean(inside))

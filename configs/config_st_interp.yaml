@@ -54,6 +54,9 @@ split_method: random              # Train/valid split method: 'site-wise' or 'ra
 train_ratio: 0.8                  # Train/valid split ratio (1.0 = all obs for training, no valid)
 calibration_ratio_from_train: 0.3 # When train_ratio=1.0 and multi-quantile: fraction of train for conformal cal (0.1–0.3); 0 = off
 calibration_split_method: random  # How to split cal from train: 'random' (random (t,s)) or 'site-wise' (subset of sites → cal, more like test)
+conformal_mode: both             # global | cluster | both (compute global + cluster-aware CQR for comparison)
+conformal_center_source: init    # init | trained (use initial or trained spatial centers for cluster assignment)
+conformal_cluster_min_n: 30      # min samples per cluster; smaller clusters use global qhat fallback
 normalize_target: false           # Normalize target values
 
 # Training settings

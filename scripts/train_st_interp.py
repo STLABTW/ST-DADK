@@ -32,7 +32,12 @@ sys.path.append(str(Path(__file__).parent.parent))
 from stnf.models.st_interp import STInterpMLP, create_model
 from stnf.dataio.kaust_loader import load_kaust_csv_single, load_kaust_csv_with_test_gt
 from stnf.utils import set_seed, compute_metrics, ModelEMA
-from stnf.utils.conformal import compute_cqr_qhat, compute_conformal_coverage
+from stnf.utils.conformal import (
+    compute_cqr_qhat,
+    compute_conformal_coverage,
+    compute_cluster_aware_cqr,
+    compute_cluster_conformal_coverage,
+)
 
 
 def quantile_loss(y_pred, y_true, quantile):
@@ -311,6 +316,32 @@ def _get_quantile_predictions(model, data_loader, device):
     if trues.ndim > 1:
         trues = trues.flatten()
     return preds, trues
+
+
+def _get_quantile_predictions_with_coords(model, data_loader, device):
+    """Like _get_quantile_predictions but also return coords (N, 2) for cluster assignment."""
+    model.eval()
+    all_preds, all_trues, all_coords = [], [], []
+    with torch.no_grad():
+        for batch in data_loader:
+            X = batch['X'].to(device)
+            coords = batch['coords'].to(device)
+            t = batch['t'].to(device)
+            y = batch['y'].to(device)
+            y_pred = model(X, coords, t)
+            all_preds.append(y_pred.cpu().numpy())
+            all_trues.append(y.cpu().numpy())
+            all_coords.append(coords.cpu().numpy())
+    if len(all_preds) == 0:
+        return np.empty((0, 0)), np.empty(0), np.empty((0, 2))
+    preds = np.concatenate(all_preds, axis=0)
+    trues = np.concatenate(all_trues, axis=0)
+    coords = np.concatenate(all_coords, axis=0)
+    if trues.ndim > 1:
+        trues = trues.flatten()
+    if coords.ndim == 1:
+        coords = coords.reshape(-1, 2)
+    return preds, trues, coords
 
 
 def create_spatial_obs_prob_fn(pattern='uniform', intensity=1.0):
@@ -2885,6 +2916,10 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     conformal_qhat = None
     calibration_n = None
     calibration_coverage_90 = None  # diagnostic: coverage of conformal interval on cal set (target ~0.90)
+    test_coverage_90_conformal_global = None
+    test_coverage_90_conformal_cluster = None
+    mean_qhat_global = None
+    mean_qhat_cluster = None
     calibration_loader = val_loader if len(val_dataset) > 0 else (cal_loader if len(cal_dataset) > 0 else None)
     if (
         config.get('regression_type') == 'multi-quantile'
@@ -2892,31 +2927,65 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
         and len(calibration_loader.dataset) > 0
     ):
         quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
+        conformal_mode = config.get('conformal_mode', 'both')
         cal_preds, cal_y_true = _get_quantile_predictions(model, calibration_loader, device)
         if cal_preds.size > 0:
             conformal_qhat, calibration_n = compute_cqr_qhat(
                 cal_preds, cal_y_true, quantile_levels, alpha=conformal_alpha
             )
-            print(f"Conformal qhat: {conformal_qhat:.6f} (calibration n={calibration_n})  [small qhat => interval already good or cal/test mismatch]")
-            # Calibration coverage: fraction of cal set inside [q_lo-qhat, q_hi+qhat] (diagnostic: should be ~0.90)
+            mean_qhat_global = conformal_qhat
+            print(f"Conformal qhat (global): {conformal_qhat:.6f} (calibration n={calibration_n})  [small qhat => interval already good or cal/test mismatch]")
             calibration_coverage_90 = compute_conformal_coverage(
                 cal_preds, cal_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
             )
             print(f"Calibration - Coverage (90% PI, conformal): {calibration_coverage_90:.4f} (target 0.90)")
             test_preds, test_y_true = _get_quantile_predictions(model, test_loader, device)
-            coverage_90_conformal = compute_conformal_coverage(
-                test_preds, test_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
-            )
-            test_metrics['coverage_90_conformal'] = coverage_90_conformal
-            print(f"Test  - Coverage (90% PI, conformal): {coverage_90_conformal:.4f} (target 0.90)")
-            # Optional: train/valid conformal coverage for debugging
-            train_preds, train_y_true = _get_quantile_predictions(model, train_loader, device)
-            train_metrics['coverage_90_conformal'] = compute_conformal_coverage(
-                train_preds, train_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
-            )
-            val_metrics['coverage_90_conformal'] = compute_conformal_coverage(
-                cal_preds, cal_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
-            )
+            if conformal_mode in ('global', 'both'):
+                coverage_90_conformal = compute_conformal_coverage(
+                    test_preds, test_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+                )
+                test_metrics['coverage_90_conformal'] = coverage_90_conformal
+                test_coverage_90_conformal_global = coverage_90_conformal
+                print(f"Test  - Coverage (90% PI, conformal global): {coverage_90_conformal:.4f} (target 0.90)")
+            if conformal_mode in ('global', 'both'):
+                train_preds, train_y_true = _get_quantile_predictions(model, train_loader, device)
+                train_metrics['coverage_90_conformal'] = compute_conformal_coverage(
+                    train_preds, train_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+                )
+                val_metrics['coverage_90_conformal'] = compute_conformal_coverage(
+                    cal_preds, cal_y_true, quantile_levels, conformal_qhat, alpha=conformal_alpha
+                )
+
+            # Cluster-aware conformal (same run, fair comparison)
+            if conformal_mode in ('cluster', 'both'):
+                try:
+                    cal_preds2, cal_y_true2, cal_coords = _get_quantile_predictions_with_coords(
+                        model, calibration_loader, device
+                    )
+                    test_preds2, test_y_true2, test_coords = _get_quantile_predictions_with_coords(
+                        model, test_loader, device
+                    )
+                    center_source = config.get('conformal_center_source', 'init')
+                    if center_source == 'init' and model_initial is not None:
+                        centers = model_initial.spatial_basis.centers.detach().cpu().numpy()
+                    else:
+                        centers = model.spatial_basis.centers.detach().cpu().numpy()
+                    min_n = config.get('conformal_cluster_min_n', 30)
+                    qhat_per_cluster, _, mean_qhat_cluster, num_fallback_clusters = compute_cluster_aware_cqr(
+                        cal_preds2, cal_y_true2, cal_coords, centers,
+                        quantile_levels, alpha=conformal_alpha, min_n=min_n,
+                        global_qhat_fallback=conformal_qhat
+                    )
+                    test_coverage_90_conformal_cluster = compute_cluster_conformal_coverage(
+                        test_preds2, test_y_true2, test_coords, centers, qhat_per_cluster,
+                        quantile_levels, alpha=conformal_alpha, global_qhat_fallback=conformal_qhat
+                    )
+                    n_centers = len(centers)
+                    print(f"Test  - Coverage (90% PI, conformal cluster): {test_coverage_90_conformal_cluster:.4f} (target 0.90)")
+                    print(f"  mean_qhat_global={mean_qhat_global:.4f}, mean_qhat_cluster={mean_qhat_cluster:.4f}, "
+                          f"clusters: {n_centers} total, {num_fallback_clusters} fallback (n<{min_n})")
+                except Exception as e:
+                    print(f"[WARNING] Cluster-aware conformal failed: {e}")
     
     # Calculate total time
     total_time = time.time() - start_time
@@ -2989,6 +3058,10 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
             'train_coverage_90_conformal': train_metrics.get('coverage_90_conformal'),
             'valid_coverage_90_conformal': val_metrics.get('coverage_90_conformal'),
             'test_coverage_90_conformal': test_metrics.get('coverage_90_conformal'),
+            'test_coverage_90_conformal_global': test_coverage_90_conformal_global,
+            'test_coverage_90_conformal_cluster': test_coverage_90_conformal_cluster,
+            'mean_qhat_global': mean_qhat_global,
+            'mean_qhat_cluster': mean_qhat_cluster,
             # Keep compatibility with old format (using median quantile)
             'train_mse': train_metrics['mse'],
             'valid_mse': val_metrics['mse'],
