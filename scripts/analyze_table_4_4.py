@@ -245,6 +245,14 @@ def main():
         pivot_df.to_csv(pivot_path)
         print(f"Pivot table saved to: {pivot_path}")
 
+    # Report spatial visualizations (from run_table_4_4 per-scenario aggregation)
+    for scenario_dir in results_dir.iterdir():
+        if scenario_dir.is_dir():
+            summary_dir = scenario_dir / 'summary'
+            if (summary_dir / 'spatial_coverage_aggregated.png').exists():
+                print(f"\nSpatial coverage map: {scenario_dir.name}/summary/spatial_coverage_aggregated.png")
+                break
+
 
 if __name__ == '__main__':
     main()

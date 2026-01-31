@@ -57,6 +57,8 @@ calibration_split_method: random  # How to split cal from train: 'random' (rando
 conformal_mode: both             # global | cluster | both (compute global + cluster-aware CQR for comparison)
 conformal_center_source: init    # init | trained (use initial or trained spatial centers for cluster assignment)
 conformal_cluster_min_n: 30      # min samples per cluster; smaller clusters use global qhat fallback
+conformal_alpha: 0.1             # nominal miscoverage (0.1 -> 90% PI)
+save_predictions_quantile: true  # save (T,S,Q) for spatial coverage viz; false to reduce disk (predictions.npz)
 normalize_target: false           # Normalize target values
 
 # Training settings
