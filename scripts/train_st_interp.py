@@ -10,6 +10,7 @@ Usage:
     python scripts/train_st_interp.py --config configs/config_st_interp.yaml
 """
 import argparse
+import warnings
 import yaml
 import torch
 import torch.nn as nn
@@ -1655,7 +1656,8 @@ def plot_spatial_coverage_and_qhat(output_dir):
 
 def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir, 
                          valid_mask=None, test_mask=None, n_sites=4, quantile_models=None, quantile_levels=None,
-                         conformal_qhat=None, conformal_alpha=0.1):
+                         conformal_qhat=None, conformal_alpha=0.1,
+                         conformal_qhat_per_cluster=None, conformal_centers=None):
     """
     Plot temporal series for selected spatial locations
     
@@ -1671,8 +1673,10 @@ def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
         n_sites: number of sites to plot
         quantile_models: dict of {quantile_level: model} for quantile regression (optional)
         quantile_levels: list of quantile levels (optional)
-        conformal_qhat: CQR expansion (optional); if set, plot conformal 90% PI band [q_lo-qhat, q_hi+qhat]
+        conformal_qhat: global CQR expansion (optional); if set, plot global 90% PI band [q_lo-qhat, q_hi+qhat]
         conformal_alpha: nominal miscoverage for conformal (0.1 -> 90% PI)
+        conformal_qhat_per_cluster: dict or array of per-cluster qhat (optional)
+        conformal_centers: (C, 2) spatial centers for cluster assignment (optional)
     """
     matplotlib.use('Agg')
     
@@ -1881,7 +1885,9 @@ def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                        label=f'τ={q_level}', alpha=0.8)
             
             # Conformal 90% PI: draw only the *expansion margin* (qhat) so it's clearly distinct from quantile band
-            if conformal_qhat is not None and conformal_qhat > 0:
+            has_global = conformal_qhat is not None and conformal_qhat > 0
+            has_cluster = conformal_qhat_per_cluster is not None and conformal_centers is not None
+            if has_global or has_cluster:
                 q_lo = conformal_alpha / 2
                 q_hi = 1.0 - conformal_alpha / 2
                 q_levels_arr = np.asarray(quantile_levels)
@@ -1891,15 +1897,36 @@ def plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                 q_hi_level = quantile_levels[idx_hi]
                 q_lo_line = quantile_predictions[q_lo_level][:, site_idx]
                 q_hi_line = quantile_predictions[q_hi_level][:, site_idx]
-                conf_low = q_lo_line - conformal_qhat
-                conf_high = q_hi_line + conformal_qhat
-                # Fill only the conformal *margin* (below q_lo and above q_hi) so it's obvious conformal = quantile + expansion
-                ax.fill_between(time_points, conf_low, q_lo_line, alpha=0.4, color='purple', 
-                                label='90% PI (conformal margin)' if idx == 0 else None, zorder=1)
-                ax.fill_between(time_points, q_hi_line, conf_high, alpha=0.4, color='purple', zorder=1)
-                ax.plot(time_points, conf_low, '--', color='purple', linewidth=2, alpha=0.9, 
-                        label='conformal bound' if idx == 0 else None, zorder=2)
-                ax.plot(time_points, conf_high, '--', color='purple', linewidth=2, alpha=0.9, zorder=2)
+
+                if has_global:
+                    conf_low = q_lo_line - conformal_qhat
+                    conf_high = q_hi_line + conformal_qhat
+                    # Global conformal margin (purple)
+                    ax.fill_between(time_points, conf_low, q_lo_line, alpha=0.35, color='purple',
+                                    label='90% PI (global conformal)' if idx == 0 else None, zorder=1)
+                    ax.fill_between(time_points, q_hi_line, conf_high, alpha=0.35, color='purple', zorder=1)
+                    ax.plot(time_points, conf_low, '--', color='purple', linewidth=2, alpha=0.9,
+                            label=None, zorder=2)
+                    ax.plot(time_points, conf_high, '--', color='purple', linewidth=2, alpha=0.9, zorder=2)
+
+                if has_cluster:
+                    centers = np.asarray(conformal_centers)
+                    cluster_id = int(_assign_nearest_center(coords_np[[site_idx]], centers)[0])
+                    if isinstance(conformal_qhat_per_cluster, dict):
+                        qhat_site = conformal_qhat_per_cluster.get(cluster_id, conformal_qhat or 0.0)
+                    else:
+                        qhat_arr = np.asarray(conformal_qhat_per_cluster)
+                        qhat_site = float(qhat_arr[cluster_id]) if cluster_id < len(qhat_arr) else float(conformal_qhat or 0.0)
+                    if qhat_site > 0:
+                        conf_low_c = q_lo_line - qhat_site
+                        conf_high_c = q_hi_line + qhat_site
+                        # Cluster-aware conformal margin (teal)
+                        ax.fill_between(time_points, conf_low_c, q_lo_line, alpha=0.30, color='#1b9e77',
+                                        label='90% PI (cluster-aware conformal)' if idx == 0 else None, zorder=1)
+                        ax.fill_between(time_points, q_hi_line, conf_high_c, alpha=0.30, color='#1b9e77', zorder=1)
+                        ax.plot(time_points, conf_low_c, '--', color='#1b9e77', linewidth=2, alpha=0.9,
+                                label=None, zorder=2)
+                        ax.plot(time_points, conf_high_c, '--', color='#1b9e77', linewidth=2, alpha=0.9, zorder=2)
             
             # Plot observed data (all circles) - Test: gray, Train+Valid: black
             if test_obs.sum() > 0:
@@ -3240,10 +3267,14 @@ def _run_single_quantile_experiment(config: dict, experiment_id: int, output_dir
     regression_type = config.get('regression_type', 'mean')
     if regression_type == 'multi-quantile':
         quantile_levels = config.get('quantile_levels', [0.1, 0.5, 0.9])
-        plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
-                            valid_mask=valid_mask, test_mask=test_mask, n_sites=4,
-                            quantile_levels=quantile_levels,
-                            conformal_qhat=conformal_qhat, conformal_alpha=conformal_alpha)
+        plot_temporal_series(
+            model, z_full, coords, train_mask, device, output_dir,
+            valid_mask=valid_mask, test_mask=test_mask, n_sites=4,
+            quantile_levels=quantile_levels,
+            conformal_qhat=conformal_qhat, conformal_alpha=conformal_alpha,
+            conformal_qhat_per_cluster=qhat_per_cluster_saved,
+            conformal_centers=cluster_centers_saved
+        )
     else:
         plot_temporal_series(model, z_full, coords, train_mask, device, output_dir,
                             valid_mask=valid_mask, test_mask=test_mask, n_sites=4)
@@ -3593,8 +3624,10 @@ def create_averaged_spatial_coverage(all_results, summary_dir, quantile_levels=N
         print("No experiments with conformal info found. Skipping averaged spatial coverage.")
         return
 
-    cov_nominal_avg = np.nanmean(np.array(all_cov_nominal), axis=0)
-    cov_cluster_avg = np.nanmean(np.array(all_cov_cluster), axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        cov_nominal_avg = np.nanmean(np.array(all_cov_nominal), axis=0)
+        cov_cluster_avg = np.nanmean(np.array(all_cov_cluster), axis=0)
     valid_sites = ~np.isnan(cov_nominal_avg)
     S = len(coords_ref)
     cluster_ids = _assign_nearest_center(coords_ref, spatial_centers_ref)
